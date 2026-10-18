@@ -17,94 +17,28 @@
 // vkGetInstanceProcAddr(NULL, ...), instance level commands with a live
 // instance, and device level commands through vkGetDeviceProcAddr.
 
-#include <vulkan/vulkan.h>
+#include "harness.h"
 
-#include <dlfcn.h>
-
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-
-namespace {
-
-int g_failures = 0;
-
-void check(bool ok, const char* what) {
-  std::printf("  %-58s %s\n", what, ok ? "ok" : "FAILED");
-  if (!ok)
-    ++g_failures;
-}
-
-// Copies one function pointer into another typed slot of the same size.  Using
-// memcpy keeps the void* -> function pointer conversion out of the source.
-template <typename Fn, typename From>
-Fn to_fn(From symbol) {
-  static_assert(sizeof(Fn) == sizeof(From), "function pointer size mismatch");
-  Fn fn = nullptr;
-  std::memcpy(&fn, &symbol, sizeof(fn));
-  return fn;
-}
-
-void require(const char* name, PFN_vkVoidFunction fn) {
-  if (fn == nullptr) {
-    std::printf("  missing entry point: %s\n", name);
-    ++g_failures;
-  }
-}
-
-void* load_loader() {
-  const char* name = std::getenv("KNIZ_TEST_LOADER");
-  if (name == nullptr || *name == '\0')
-    name = "libvulkan.so.1";
-
-  void* lib = dlopen(name, RTLD_NOW | RTLD_LOCAL);
-  if (lib == nullptr)
-    std::fprintf(stderr, "cannot open '%s': %s\n", name, dlerror());
-  return lib;
-}
-
-PFN_vkVoidFunction (*g_get_instance_proc_addr)(VkInstance, const char*) = nullptr;
-PFN_vkGetDeviceProcAddr g_get_device_proc_addr = nullptr;
-
-template <typename Fn>
-Fn instance_proc(VkInstance instance, const char* name) {
-  return to_fn<Fn>(g_get_instance_proc_addr(instance, name));
-}
-
-template <typename Fn>
-Fn device_proc(VkDevice device, const char* name) {
-  return to_fn<Fn>(g_get_device_proc_addr(device, name));
-}
-
-}  // namespace
+using namespace kniz_test;
 
 int main() {
   std::printf("kniz lifecycle test\n");
 
-  if (std::getenv("VK_ICD_FILENAMES") == nullptr) {
-    std::fprintf(stderr,
-                 "VK_ICD_FILENAMES is not set; the test would run against "
-                 "whatever ICD is registered on this system\n");
+  if (!icd_selected())
     return 2;
-  }
 
-  void* loader = load_loader();
+  void* loader = open_loader();
   if (loader == nullptr)
     return 2;
 
-  g_get_instance_proc_addr =
-      to_fn<PFN_vkVoidFunction (*)(VkInstance, const char*)>(
-          dlsym(loader, "vkGetInstanceProcAddr"));
-  if (g_get_instance_proc_addr == nullptr) {
-    std::fprintf(stderr, "loader has no vkGetInstanceProcAddr\n");
+  if (!resolve_get_instance_proc_addr(loader))
     return 2;
-  }
 
   // ---- global commands (valid with a NULL instance) ------------------------
   auto create_instance =
       instance_proc<PFN_vkCreateInstance>(nullptr, "vkCreateInstance");
   require("vkCreateInstance", reinterpret_cast<PFN_vkVoidFunction>(create_instance));
-  if (g_failures > 0)
+  if (failures() > 0)
     return 2;
 
   VkApplicationInfo app{};
@@ -143,12 +77,12 @@ int main() {
           reinterpret_cast<PFN_vkVoidFunction>(get_queue_families));
   require("vkCreateDevice", reinterpret_cast<PFN_vkVoidFunction>(create_device));
 
-  g_get_device_proc_addr =
+  get_device_proc_addr =
       instance_proc<PFN_vkGetDeviceProcAddr>(instance, "vkGetDeviceProcAddr");
   require("vkGetDeviceProcAddr",
-          reinterpret_cast<PFN_vkVoidFunction>(g_get_device_proc_addr));
+          reinterpret_cast<PFN_vkVoidFunction>(get_device_proc_addr));
 
-  if (g_failures > 0) {
+  if (failures() > 0) {
     destroy_instance(instance, nullptr);
     return 1;
   }
@@ -212,7 +146,7 @@ int main() {
   require("vkDestroyDevice", reinterpret_cast<PFN_vkVoidFunction>(destroy_device));
   require("vkGetDeviceQueue", reinterpret_cast<PFN_vkVoidFunction>(get_device_queue));
   require("vkDeviceWaitIdle", reinterpret_cast<PFN_vkVoidFunction>(device_wait_idle));
-  if (g_failures > 0) {
+  if (failures() > 0) {
     destroy_device(device, nullptr);
     destroy_instance(instance, nullptr);
     return 1;
@@ -236,10 +170,10 @@ int main() {
   destroy_instance(instance, nullptr);
   check(true, "vkDestroyInstance");
 
-  if (g_failures == 0) {
+  if (failures() == 0) {
     std::printf("PASSED\n");
     return 0;
   }
-  std::printf("FAILED: %d check(s)\n", g_failures);
+  std::printf("FAILED: %d check(s)\n", failures());
   return 1;
 }

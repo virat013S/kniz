@@ -20,8 +20,6 @@
 
 #include <vulkan/vulkan.h>
 
-#include <dlfcn.h>
-
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -31,43 +29,11 @@
 #include <string>
 #include <vector>
 
+#include "harness.h"
+
+using namespace kniz_test;
+
 namespace {
-
-int g_failures = 0;
-
-void check(bool ok, const char* what) {
-  std::printf("  %-58s %s\n", what, ok ? "ok" : "FAILED");
-  if (!ok)
-    ++g_failures;
-}
-
-template <typename Fn, typename From>
-Fn to_fn(From symbol) {
-  static_assert(sizeof(Fn) == sizeof(From), "function pointer size mismatch");
-  Fn fn = nullptr;
-  std::memcpy(&fn, &symbol, sizeof(fn));
-  return fn;
-}
-
-void require(const char* name, PFN_vkVoidFunction fn) {
-  if (fn == nullptr) {
-    std::printf("  missing entry point: %s\n", name);
-    ++g_failures;
-  }
-}
-
-PFN_vkVoidFunction (*g_get_instance_proc_addr)(VkInstance, const char*) = nullptr;
-PFN_vkGetDeviceProcAddr g_get_device_proc_addr = nullptr;
-
-template <typename Fn>
-Fn instance_proc(VkInstance instance, const char* name) {
-  return to_fn<Fn>(g_get_instance_proc_addr(instance, name));
-}
-
-template <typename Fn>
-Fn device_proc(VkDevice device, const char* name) {
-  return to_fn<Fn>(g_get_device_proc_addr(device, name));
-}
 
 std::vector<uint32_t> read_spirv(const char* path) {
   std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -97,31 +63,20 @@ constexpr uint32_t kBufferBytes = kElementCount * sizeof(uint32_t);
 int main(int argc, char** argv) {
   std::printf("kniz compute test (M1)\n");
 
-  if (std::getenv("VK_ICD_FILENAMES") == nullptr) {
-    std::fprintf(stderr,
-                 "VK_ICD_FILENAMES is not set; the test would run against "
-                 "whatever ICD is registered on this system\n");
+  if (!icd_selected())
     return 2;
-  }
 
   const char* shader_path = argc > 1 ? argv[1] : "scale.comp.spv";
   const std::vector<uint32_t> spirv = read_spirv(shader_path);
   if (spirv.empty())
     return 2;
 
-  void* loader = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-  if (loader == nullptr) {
-    std::fprintf(stderr, "cannot open libvulkan.so.1: %s\n", dlerror());
+  void* loader = open_loader();
+  if (loader == nullptr)
     return 2;
-  }
 
-  g_get_instance_proc_addr =
-      to_fn<PFN_vkVoidFunction (*)(VkInstance, const char*)>(
-          dlsym(loader, "vkGetInstanceProcAddr"));
-  if (g_get_instance_proc_addr == nullptr) {
-    std::fprintf(stderr, "loader has no vkGetInstanceProcAddr\n");
+  if (!resolve_get_instance_proc_addr(loader))
     return 2;
-  }
 
   // ---- instance ------------------------------------------------------------
   auto create_instance = instance_proc<PFN_vkCreateInstance>(nullptr, "vkCreateInstance");
@@ -154,10 +109,10 @@ int main(int argc, char** argv) {
 
   // Device commands are reached through vkGetDeviceProcAddr, which is itself an
   // instance level command and has to be resolved before any device exists.
-  g_get_device_proc_addr =
+  get_device_proc_addr =
       instance_proc<PFN_vkGetDeviceProcAddr>(instance, "vkGetDeviceProcAddr");
   require("vkGetDeviceProcAddr",
-          reinterpret_cast<PFN_vkVoidFunction>(g_get_device_proc_addr));
+          reinterpret_cast<PFN_vkVoidFunction>(get_device_proc_addr));
 
   uint32_t device_count = 0;
   enumerate_physical(instance, &device_count, nullptr);
@@ -253,7 +208,7 @@ int main(int argc, char** argv) {
   require("vkCmdDispatch", reinterpret_cast<PFN_vkVoidFunction>(cmd_dispatch));
   require("vkCreateComputePipelines",
           reinterpret_cast<PFN_vkVoidFunction>(create_compute_pipelines));
-  if (g_failures > 0) {
+  if (failures() > 0) {
     destroy_device(device, nullptr);
     destroy_instance(instance, nullptr);
     return 1;
@@ -619,10 +574,10 @@ int main(int argc, char** argv) {
   destroy_instance(instance, nullptr);
   check(true, "teardown");
 
-  if (g_failures == 0) {
+  if (failures() == 0) {
     std::printf("PASSED\n");
     return 0;
   }
-  std::printf("FAILED: %d check(s)\n", g_failures);
+  std::printf("FAILED: %d check(s)\n", failures());
   return 1;
 }
