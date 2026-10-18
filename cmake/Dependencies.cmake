@@ -28,7 +28,15 @@ find_package(PkgConfig REQUIRED)
 find_package(VulkanHeaders CONFIG QUIET)
 
 if(VulkanHeaders_FOUND)
-  set(KNIZ_VULKAN_HEADERS_SOURCE "system${VulkanHeaders_VERSION:+ (${VulkanHeaders_VERSION})}")
+  # CMake has no ${VAR:+alternate} form -- that is shell syntax, and writing it
+  # here is a configure-time syntax error on precisely those distributions whose
+  # VulkanHeaders package is found (Fedora, Arch), while looking fine on any
+  # distribution that falls through to FetchContent.
+  if(VulkanHeaders_VERSION)
+    set(KNIZ_VULKAN_HEADERS_SOURCE "system (${VulkanHeaders_VERSION})")
+  else()
+    set(KNIZ_VULKAN_HEADERS_SOURCE "system")
+  endif()
 elseif(KNIZ_FETCH_DEPS)
   set(KNIZ_VULKAN_HEADERS_SOURCE "fetched (${KNIZ_VULKAN_HEADERS_TAG})")
 

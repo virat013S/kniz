@@ -19,13 +19,18 @@ jobs:
   # on one package set.  The three distributions chosen exercise all three
   # dependency paths:
   #
-  #   Ubuntu  no VulkanHeaders CMake package  -> FetchContent fallback
-  #   Fedora  vulkan-headers package          -> find_package
-  #   Arch    vulkan-headers package          -> find_package
+  #   Ubuntu  only the loader is installed, no headers package -> FetchContent
+  #   Fedora  vulkan-headers package                            -> find_package
+  #   Arch    vulkan-headers package                            -> find_package
   #
   # Nothing is installed with sudo, and no distribution-specific build recipe
-  # exists: each job installs a compiler, a build system, EGL headers and a
-  # loader, then runs the same three commands.
+  # exists: each job installs a compiler, a build system, EGL headers, a loader
+  # and CA certificates, then runs the same three commands.
+  #
+  # ca-certificates is in that list because two of these paths clone over HTTPS,
+  # and a minimal container image frequently has no trust store: the failure is
+  # then "server certificate verification failed. CAfile: none", which looks like
+  # a network problem rather than a missing package.
   # ---------------------------------------------------------------------------
   linux:
     name: ${{ matrix.name }}
@@ -39,7 +44,7 @@ jobs:
             packages: >-
               apt-get update &&
               apt-get install -y --no-install-recommends
-              build-essential cmake ninja-build pkg-config git
+              build-essential cmake ninja-build pkg-config git ca-certificates
               libegl1-mesa-dev libgl1-mesa-dri
               libvulkan1 vulkan-tools
 
@@ -47,7 +52,7 @@ jobs:
             container: fedora:latest
             packages: >-
               dnf install -y
-              gcc-c++ cmake ninja-build pkgconf-pkg-config git
+              gcc-c++ cmake ninja-build pkgconf-pkg-config git ca-certificates
               mesa-libEGL-devel mesa-dri-drivers
               vulkan-loader vulkan-headers vulkan-tools
 
@@ -57,7 +62,7 @@ jobs:
               pacman-key --init &&
               pacman-key --populate archlinux &&
               pacman -Syu --noconfirm --needed
-              base-devel cmake ninja pkgconf git
+              base-devel cmake ninja pkgconf git ca-certificates
               mesa
               vulkan-icd-loader vulkan-headers vulkan-tools
 
