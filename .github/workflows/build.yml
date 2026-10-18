@@ -1,0 +1,130 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux, across distributions.
+  #
+  # Every job runs inside a distribution's own container rather than on the
+  # GitHub runner image, because the point is to prove the build does not depend
+  # on one package set.  The three distributions chosen exercise all three
+  # dependency paths:
+  #
+  #   Ubuntu  no VulkanHeaders CMake package  -> FetchContent fallback
+  #   Fedora  vulkan-headers package          -> find_package
+  #   Arch    vulkan-headers package          -> find_package
+  #
+  # Nothing is installed with sudo, and no distribution-specific build recipe
+  # exists: each job installs a compiler, a build system, EGL headers and a
+  # loader, then runs the same three commands.
+  # ---------------------------------------------------------------------------
+  linux:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu
+            container: ubuntu:24.04
+            packages: >-
+              apt-get update &&
+              apt-get install -y --no-install-recommends
+              build-essential cmake ninja-build pkg-config git
+              libegl1-mesa-dev libgl1-mesa-dri
+              libvulkan1 vulkan-tools
+
+          - name: fedora
+            container: fedora:latest
+            packages: >-
+              dnf install -y
+              gcc-c++ cmake ninja-build pkgconf-pkg-config git
+              mesa-libEGL-devel mesa-dri-drivers
+              vulkan-loader vulkan-headers vulkan-tools
+
+          - name: arch
+            container: archlinux:latest
+            packages: >-
+              pacman-key --init &&
+              pacman-key --populate archlinux &&
+              pacman -Syu --noconfirm --needed
+              base-devel cmake ninja pkgconf git
+              mesa
+              vulkan-icd-loader vulkan-headers vulkan-tools
+
+    container:
+      image: ${{ matrix.container }}
+
+    env:
+      # No GPU is reachable from the container, so force Mesa's software
+      # rasteriser.  This also exercises the surfaceless EGL path, which is what
+      # Kniz falls back to when there is no X11 or Wayland display.
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      # The test binary dlopens the loader; setting this makes a missing loader
+      # an explicit failure rather than a silent skip.
+      KNIZ_TEST_LOADER: libvulkan.so.1
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: ${{ matrix.packages }}
+
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DKNIZ_WERROR=ON
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Show reported device
+        run: |
+          VK_ICD_FILENAMES="$PWD/build/src/kniz_icd.json" \
+            vulkaninfo --summary 2>&1 | grep -vE '^kniz: ' || true
+
+  # ---------------------------------------------------------------------------
+  # A build with every optional dependency path disabled, to prove the system
+  # package route works on its own.  Fedora ships vulkan-headers, so this
+  # configuration must resolve everything without network access to GitHub.
+  # ---------------------------------------------------------------------------
+  no-fetch:
+    name: no-fetch (system packages only)
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: >
+          dnf install -y
+          gcc-c++ cmake ninja-build pkgconf-pkg-config
+          mesa-libEGL-devel vulkan-headers
+
+      - name: Configure without FetchContent
+        run: >
+          cmake -S . -B build -G Ninja
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DKNIZ_FETCH_DEPS=OFF
+          -DKNIZ_BUILD_TESTS=OFF
+          -DKNIZ_WERROR=ON
+
+      - name: Build
+        run: cmake --build build

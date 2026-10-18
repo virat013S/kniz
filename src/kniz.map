@@ -1,0 +1,18 @@
+/*
+ * Linker version script for the Kniz ICD.
+ *
+ * Only the Vulkan entry points leave the shared object.  Everything else --
+ * our internal C++ symbols, the C++ runtime, and anything pulled in from EGL --
+ * stays local, so the library cannot collide with symbols already present in
+ * the application or the Vulkan loader.
+ *
+ * This matters more than usual for Kniz: we also link EGL and resolve OpenGL
+ * entry points at runtime, so the process frequently already has a GL stack
+ * loaded by the time the loader dlopen()s us.
+ */
+{
+  global:
+    vk*;
+  local:
+    *;
+};
