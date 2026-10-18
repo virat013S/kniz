@@ -2,10 +2,18 @@ add_library(kniz SHARED
   icd/kniz_common.cpp
   icd/kniz_gl.cpp
   icd/kniz_icd.cpp
-  icd/kniz_device.cpp)
+  icd/kniz_device.cpp
+  icd/kniz_shader.cpp
+  icd/kniz_memory.cpp
+  icd/kniz_descriptor.cpp
+  icd/kniz_pipeline.cpp
+  icd/kniz_command.cpp)
 
 target_include_directories(kniz PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/icd")
-target_link_libraries(kniz PRIVATE Vulkan::Headers PkgConfig::EGL)
+target_link_libraries(kniz PRIVATE
+  Vulkan::Headers
+  PkgConfig::EGL
+  Kniz::spirv-cross-glsl)
 
 target_compile_definitions(kniz PRIVATE
   KNIZ_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}

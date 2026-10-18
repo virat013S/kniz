@@ -241,7 +241,7 @@ deliberately plain:
 | | Goal | Proves | Gate |
 |---|---|---|---|
 | **M0** ✅ | Manifest + `vk_icdGetInstanceProcAddr`; `vulkaninfo` lists our device; headless EGL context created | Loader handshake | `vulkaninfo --summary` shows Kniz |
-| **M1** | Offscreen compute end-to-end, checked against a CPU reference | SPIR-V→GLSL, memory, descriptors — the whole risky spine | numeric test passes |
+| **M1** ✅ | Offscreen compute end-to-end, checked against a CPU reference | SPIR-V→GLSL, memory, descriptors — the whole risky spine | numeric test passes |
 | **M2** | Offscreen graphics: render pass → FBO, PSO → program, triangle → image | Passes, pipelines, state | image matches reference |
 | **M3** | GLX/EGL swapchain | WSI | `vkcube` on screen |
 | **M4** | Fences, events, timestamps, queries | Correctness | sample suite runs |
@@ -251,8 +251,40 @@ M0 is done and was checked on the development machine (Intel HD 4400 / Mesa
 reported `Kniz on Mesa Intel(R) HD Graphics 4400 (HSW GT2)`. The same test passes
 with no display present, via the surfaceless EGL path.
 
-M1 deliberately bundles the three scariest subsystems so failure is cheap and
+M1 is done and passed the same way. Its test (`tests/compute.cpp`) records a
+dispatch over two storage buffers and compares all 1024 elements against a C++
+reference; it also covers `vkCmdFillBuffer`, `vkCmdUpdateBuffer` and
+`vkCmdCopyBuffer`, and asserts that a graphics pipeline is *refused* rather than
+accepted and ignored. Three things M1 settled, each of which could have been
+fatal:
+
+- **SPIR-V→GLSL works, but needs the pipeline layout.** A `VkShaderModule` alone
+  is not enough to translate: SPIR-V addresses resources by `(set, binding)`,
+  GLSL by one flat binding number, and two sets may legally share a binding
+  number. So translation happens at *pipeline* creation, where the layout is
+  known, and the resulting `(set, binding) → GL index` table is stored on the
+  pipeline. The generated GLSL and the dispatch path read the same table, which
+  is what stops them disagreeing. Indices are compacted rather than computed as
+  `set * width + binding`, because `GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS` can be
+  as low as 8.
+- **The emulated `VkDeviceMemory` round trip is sound.** An allocation is host
+  memory; buffers copy in and out of it around each submission, keyed off a
+  version counter bumped on unmap. The invariant that makes it correct is that
+  the host block is a *mirror*: results are copied back after every submission,
+  so a later upload cannot resurrect stale bytes.
+- **Constant transcription is a real hazard.** `GL_SHADER_STORAGE_BUFFER` is
+  `0x90D2`; `0x90D3` is `GL_SHADER_STORAGE_BLOCK`. The wrong value produced
+  `GL_INVALID_ENUM` from `glBindBufferRange` and a dispatch that silently wrote
+  nothing. Reading the error back is what found it, which is why the replay path
+  drains `glGetError` around binding and dispatch rather than trusting itself.
+
+M1 deliberately bundled the three scariest subsystems so failure was cheap and
 early.
+
+What M1 does *not* cover, and M2 has to add: uniform buffers, push constants,
+textures and samplers, images, render passes, graphics pipelines. All of them are
+refused with an explicit error today, at the earliest point the application
+reveals it needs one.
 
 ## 5. Non-goals
 

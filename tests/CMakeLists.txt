@@ -9,15 +9,29 @@ add_executable(kniz_lifecycle lifecycle.cpp)
 target_link_libraries(kniz_lifecycle PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
 target_compile_options(kniz_lifecycle PRIVATE -Wall -Wextra)
 
+# The M1 milestone test: a compute dispatch whose output is compared against a
+# CPU reference.  It reads its shader from a file, so the path is passed as an
+# argument rather than baked into the binary.
+add_executable(kniz_compute compute.cpp)
+
+target_link_libraries(kniz_compute PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+target_compile_options(kniz_compute PRIVATE -Wall -Wextra)
+
 if(KNIZ_WERROR)
   target_compile_options(kniz_lifecycle PRIVATE -Werror)
+  target_compile_options(kniz_compute PRIVATE -Werror)
 endif()
 
 add_test(NAME lifecycle COMMAND kniz_lifecycle)
+add_test(NAME compute
+  COMMAND kniz_compute "${CMAKE_CURRENT_SOURCE_DIR}/shaders/scale.comp.spv")
 
 # The loader resolves the manifest's library_path relative to the manifest's own
 # directory, so build/src is where both the library and its manifest live:
 # choosing the manifest there makes VK_ICD_FILENAMES work straight from the
 # build tree, with no install step.
-set_tests_properties(lifecycle PROPERTIES
-  ENVIRONMENT "VK_ICD_FILENAMES=${CMAKE_BINARY_DIR}/src/kniz_icd.json;KNIZ_LOG=2")
+set(kniz_test_environment
+  "VK_ICD_FILENAMES=${CMAKE_BINARY_DIR}/src/kniz_icd.json;KNIZ_LOG=2")
+
+set_tests_properties(lifecycle PROPERTIES ENVIRONMENT "${kniz_test_environment}")
+set_tests_properties(compute PROPERTIES ENVIRONMENT "${kniz_test_environment}")

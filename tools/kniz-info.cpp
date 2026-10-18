@@ -385,21 +385,31 @@ int main(int argc, char** argv) {
 
   // ---------------------------------------------------------------------------
   // Honest capability report.  Update as milestones land.
+  //
+  // These are claims about the driver, and the tool that reports on the driver
+  // is the last place that should be optimistic: everything marked done here is
+  // exercised by a test in tests/ that runs on every build.
   // ---------------------------------------------------------------------------
   section("What is implemented");
   capability("loader handshake, instance/device", true, "M0");
   capability("properties, limits, memory model", true, "M0");
-  capability("buffers and memory objects", false, "M1");
-  capability("SPIR-V -> GLSL translation", false, "M1");
-  capability("compute dispatch", false, "M1");
+  capability("buffers and memory objects", true, "M1");
+  capability("SPIR-V -> GLSL translation", true, "M1");
+  capability("descriptor sets (storage buffers)", true, "M1");
+  capability("compute dispatch", true, "M1");
+  capability("uniform buffers, push constants", false, "M2");
   capability("render passes, pipelines, draws", false, "M2");
   capability("swapchain / window presentation", false, "M3");
   capability("fences, queries, timestamps", false, "M4");
 
   std::printf(
-      "\n  Nothing renders yet.  Programs that only create a device and ask\n"
-      "  questions about it will work; anything that draws or presents will\n"
-      "  fail cleanly.  See docs/DESIGN.md for what OpenGL cannot express.\n"
+      "\n  Nothing renders yet: compute dispatches work and their output has been\n"
+      "  checked against a CPU reference, but there are no render passes, no\n"
+      "  graphics pipelines, no images and no presentation.  Programs that only\n"
+      "  create a device, ask questions about it, or run a compute shader over\n"
+      "  buffers will work; anything that draws or presents is refused with a\n"
+      "  specific error rather than doing something surprising.  See\n"
+      "  docs/DESIGN.md for what OpenGL cannot express at all.\n"
       "\n  The 'kniz:' lines above are the driver's own log, including the\n"
       "  OpenGL context it created to back this device.\n");
 

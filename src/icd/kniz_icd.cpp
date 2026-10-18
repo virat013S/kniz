@@ -518,14 +518,14 @@ const Entry kEntries[] = {
     {"vkGetPhysicalDeviceSparseImageFormatProperties",
      as_entry(GetPhysicalDeviceSparseImageFormatProperties)},
 
-    // Device level commands, also reachable here.  See kniz_entrypoints.h.
+    // vkGetInstanceProcAddr is the one entry point that has to be in this
+    // table: it is how anything else is found in the first place.
     {"vkGetInstanceProcAddr", as_entry(vkGetInstanceProcAddr)},
-    {"vkGetDeviceProcAddr", as_entry(GetDeviceProcAddr)},
-    {"vkCreateDevice", as_entry(CreateDevice)},
-    {"vkDestroyDevice", as_entry(DestroyDevice)},
-    {"vkGetDeviceQueue", as_entry(GetDeviceQueue)},
-    {"vkDeviceWaitIdle", as_entry(DeviceWaitIdle)},
-    {"vkQueueWaitIdle", as_entry(QueueWaitIdle)},
+
+    // The device level commands are deliberately *not* listed here.  They live
+    // in one table in kniz_device.cpp, and resolve_instance_proc falls back to
+    // it below -- which gives the same reachable set without two lists that can
+    // drift apart.
 };
 
 }  // namespace
@@ -533,10 +533,17 @@ const Entry kEntries[] = {
 PFN_vkVoidFunction resolve_instance_proc(const char* name) {
   if (name == nullptr)
     return nullptr;
+
   for (const Entry& entry : kEntries) {
     if (std::strcmp(entry.name, name) == 0)
       return entry.fn;
   }
+
+  // Instance level lookup of a device command is the documented behaviour for
+  // vkGetInstanceProcAddr, and applications and tools do rely on it.
+  if (PFN_vkVoidFunction fn = resolve_device_proc(name); fn != nullptr)
+    return fn;
+
   KNIZ_DBG("unimplemented command requested: %s", name);
   return nullptr;
 }

@@ -55,3 +55,67 @@ endif()
 # ---------------------------------------------------------------------------
 
 pkg_check_modules(EGL REQUIRED IMPORTED_TARGET egl)
+
+# ---------------------------------------------------------------------------
+# SPIRV-Cross: SPIR-V -> GLSL
+#
+# Kniz receives shaders as SPIR-V and has to hand OpenGL GLSL, so this is not
+# optional.
+#
+# This is the one dependency where the distribution's copy is often *not* the
+# useful one.  Arch and Fedora build SPIRV-Cross with SPIRV_CROSS_SHARED=ON,
+# which produces a shared object exporting only the C API and installs no CMake
+# package, so the C++ interface used here is simply absent.  The system tier is
+# still tried first -- some distributions do install the static C++ targets --
+# and the fetch tier is what usually runs.
+#
+# Arch ships the C API as `spirv-cross`, which cannot serve this purpose; the
+# pinned tag is kept in step with KNIZ_VULKAN_HEADERS_TAG because SPIRV-Cross
+# releases track Vulkan SDK versions.
+# ---------------------------------------------------------------------------
+
+set(KNIZ_SPIRV_CROSS_TAG "vulkan-sdk-1.4.363.0" CACHE STRING
+  "SPIRV-Cross git tag used when fetching")
+
+find_package(spirv_cross_glsl CONFIG QUIET)
+
+if(TARGET spirv-cross-glsl)
+  set(KNIZ_SPIRV_CROSS_SOURCE "system")
+elseif(KNIZ_FETCH_DEPS)
+  set(KNIZ_SPIRV_CROSS_SOURCE "fetched (${KNIZ_SPIRV_CROSS_TAG})")
+
+  # Only the GLSL backend is wanted.  Everything else would be dead weight in
+  # the build, and the test suite in particular pulls in Python and glslang.
+  set(SPIRV_CROSS_STATIC     ON  CACHE BOOL "" FORCE)
+  set(SPIRV_CROSS_SHARED     OFF CACHE BOOL "" FORCE)
+  set(SPIRV_CROSS_CLI        OFF CACHE BOOL "" FORCE)
+  set(SPIRV_CROSS_ENABLE_TESTS   OFF CACHE BOOL "" FORCE)
+  set(SPIRV_CROSS_ENABLE_GLSL    ON  CACHE BOOL "" FORCE)
+  set(SPIRV_CROSS_ENABLE_HLSL    OFF CACHE BOOL "" FORCE)
+  set(SPIRV_CROSS_ENABLE_MSL     OFF CACHE BOOL "" FORCE)
+  set(SPIRV_CROSS_ENABLE_CPP     OFF CACHE BOOL "" FORCE)
+  set(SPIRV_CROSS_ENABLE_REFLECT OFF CACHE BOOL "" FORCE)
+  set(SPIRV_CROSS_ENABLE_C_API   OFF CACHE BOOL "" FORCE)
+  set(SPIRV_CROSS_ENABLE_UTIL    OFF CACHE BOOL "" FORCE)
+  # Without this it installs itself into our prefix as a side effect.
+  set(SPIRV_CROSS_SKIP_INSTALL   ON  CACHE BOOL "" FORCE)
+
+  FetchContent_Declare(SPIRV-Cross
+    GIT_REPOSITORY https://github.com/KhronosGroup/SPIRV-Cross.git
+    GIT_TAG        ${KNIZ_SPIRV_CROSS_TAG}
+    GIT_SHALLOW    TRUE
+    GIT_PROGRESS   TRUE)
+  FetchContent_MakeAvailable(SPIRV-Cross)
+else()
+  message(FATAL_ERROR
+    "SPIRV-Cross (the C++ GLSL backend) was not found and KNIZ_FETCH_DEPS=OFF.\n"
+    "Kniz needs the spirv-cross-glsl target; the C API alone is not enough.\n"
+    "Install a package that provides it, or configure with -DKNIZ_FETCH_DEPS=ON.")
+endif()
+
+# The fetched build exposes its headers at the repository root, while an
+# installed copy puts them under include/spirv_cross.  Whichever tier ran, name
+# the result consistently and let the code handle both include layouts.
+if(NOT TARGET Kniz::spirv-cross-glsl)
+  add_library(Kniz::spirv-cross-glsl ALIAS spirv-cross-glsl)
+endif()

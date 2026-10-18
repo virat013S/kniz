@@ -37,9 +37,9 @@ The honest, reachable goal:
 
 ## Status
 
-**M0 complete.** Kniz registers as a Vulkan ICD, the loader hands it an instance
-and a device, and it brings up a real OpenGL context to back them. It renders
-nothing yet.
+**M1 complete.** Kniz registers as a Vulkan ICD, the loader hands it an instance
+and a device, it brings up a real OpenGL context to back them, and it can now run
+a compute shader over storage buffers. It does not render anything yet.
 
 Working today:
 
@@ -47,10 +47,15 @@ Working today:
 - `VkInstance` / `VkPhysicalDevice` / `VkDevice` / `VkQueue` creation and teardown
 - Physical device properties, limits, features, queue families, memory heaps
 - A headless OpenGL context, with and without a window system present
+- Buffers, `VkDeviceMemory`, mapping, `vkCmdFillBuffer` / `vkCmdUpdateBuffer` /
+  `vkCmdCopyBuffer`
+- SPIR-V → GLSL, compute pipelines, descriptor sets, dispatch, submission and
+  fences — verified numerically against a CPU reference, not merely exercised
 
-Not implemented: everything that draws or computes. Next is M1, an offscreen
-compute dispatch verified against a CPU reference, which exercises SPIR-V → GLSL,
-memory and descriptor sets in one step.
+Not implemented: uniform buffers, push constants, textures and samplers, images,
+render passes, graphics pipelines, presentation. Each is refused with a specific
+error at the point the application reveals it needs one, rather than accepted and
+silently ignored. Next is M2, offscreen graphics.
 
 ## Building
 
@@ -64,8 +69,15 @@ cmake --build build
 ```
 
 Dependencies are resolved in two tiers: your distribution's copy first, a pinned
-download second. Vulkan-Headers is header-only and is fetched if not found;
-EGL comes from pkg-config.
+download second. Vulkan-Headers is header-only and is fetched if not found; EGL
+comes from pkg-config.
+
+SPIRV-Cross does the SPIR-V → GLSL translation and is the one dependency where the
+distribution's copy is usually *not* the useful one: Arch and Fedora build it with
+`SPIRV_CROSS_SHARED`, which exports only the C API and installs no CMake package,
+so the C++ GLSL backend Kniz uses is absent. The pinned download is therefore what
+normally runs. It is the slowest part of a first build — about a minute, once. If
+your distribution does install the static C++ targets, they are used instead.
 
 | Distribution | Packages needed |
 |---|---|
@@ -105,9 +117,14 @@ Device
 What is implemented
   loader handshake, instance/device yes  M0
   properties, limits, memory model yes  M0
-  compute dispatch                 no   M1
+  buffers and memory objects       yes  M1
+  SPIR-V -> GLSL translation       yes  M1
+  descriptor sets (storage buffers) yes  M1
+  compute dispatch                 yes  M1
+  uniform buffers, push constants  no   M2
   render passes, pipelines, draws  no   M2
   swapchain / window presentation  no   M3
+  fences, queries, timestamps      no   M4
 ```
 
 The launcher only sets `VK_ICD_FILENAMES` and `KNIZ_LOG`, so you can always do the
@@ -140,19 +157,33 @@ Set `KNIZ_LOG=0..4` (`error`..`trace`) to control logging; the default is `2`.
 ctest --test-dir build --output-on-failure
 ```
 
-The test drives the ICD through the **real Vulkan loader**, not by calling it
-directly. That is deliberate: the most damaging class of ICD bug — a
+Two tests, both driven through the **real Vulkan loader** rather than by calling
+the ICD directly. That is deliberate: the most damaging class of ICD bug — a
 dispatchable object that does not reserve its first word for the loader's
 dispatch pointer — is invisible when the ICD is called directly, and produces a
 device handle that `vkCreateDevice` returns happily and every later call rejects.
 See the note in [`docs/DESIGN.md`](docs/DESIGN.md).
 
+- `lifecycle` — instance, device and queue creation and teardown (M0).
+- `compute` — records a dispatch over two storage buffers and compares all 1024
+  elements against a C++ reference (M1). The comparison is exact rather than a
+  tolerance, because the failure this guards against — a descriptor bound to the
+  wrong buffer — produces plausible numbers rather than an error. It also covers
+  `vkCmdFillBuffer`, `vkCmdUpdateBuffer` and `vkCmdCopyBuffer`, and asserts that a
+  graphics pipeline is *refused* rather than accepted and ignored.
+
+The shader the second test uses is checked in twice: as GLSL, and as the compiled
+SPIR-V an application would actually submit. The command that regenerates the
+SPIR-V is recorded at the top of `tests/shaders/scale.comp`, and the compiled form
+is committed so that the test suite does not depend on `glslangValidator` being
+installed.
+
 ## Layout
 
 ```
-src/icd/     the ICD: bootstrap, object model, GL backend
+src/icd/     the ICD: bootstrap, object model, GL backend, shader translation
 icd/         ICD manifest installed for loader discovery
-tests/       lifecycle test, driven through the loader
+tests/       tests driven through the loader, and the shaders they use
 tools/       kniz-info, the status report
 kniz         the launcher (top of tree)
 docs/        design notes and the fidelity budget

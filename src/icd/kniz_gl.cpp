@@ -32,14 +32,14 @@ constexpr unsigned int kGlVendor = 0x1F00;
 constexpr unsigned int kGlRenderer = 0x1F01;
 constexpr unsigned int kGlVersion = 0x1F02;
 constexpr unsigned int kGlShadingLanguageVersion = 0x8B8C;
-constexpr unsigned int kGlNoError = 0;
+constexpr unsigned int kGlShaderStorageBufferOffsetAlignment = 0x90DF;
 
 // Resolve one entry point.  eglGetProcAddress is the sanctioned route, but a
 // number of stacks return NULL for entry points that are exported directly by
 // the GL library, so dlsym is the fallback.  Both results are copied through
 // memcpy rather than reinterpret_cast from void* to avoid a
 // conditionally-supported conversion.
-bool load_proc(void* slot, size_t slot_size, const char* name) {
+bool resolve_proc(void* slot, size_t slot_size, const char* name, bool quiet) {
   auto fn = eglGetProcAddress(name);
   if (fn != nullptr) {
     if (slot_size != sizeof(fn)) {
@@ -52,7 +52,8 @@ bool load_proc(void* slot, size_t slot_size, const char* name) {
 
   void* p = dlsym(RTLD_DEFAULT, name);
   if (p == nullptr) {
-    KNIZ_ERR("EGL could not resolve %s", name);
+    if (!quiet)
+      KNIZ_ERR("EGL could not resolve %s", name);
     return false;
   }
   if (slot_size != sizeof(p)) {
@@ -62,6 +63,25 @@ bool load_proc(void* slot, size_t slot_size, const char* name) {
   std::memcpy(slot, &p, slot_size);
   return true;
 }
+
+bool load_proc(void* slot, size_t slot_size, const char* name) {
+  return resolve_proc(slot, slot_size, name, false);
+}
+
+// Silent variant.  Some entry points are legitimately absent on contexts that
+// are otherwise perfectly usable -- compute on a GL 3.3 context, for instance --
+// and reporting each one as an error would turn a supported configuration into
+// something that looks broken.
+bool try_load_proc(void* slot, size_t slot_size, const char* name) {
+  return resolve_proc(slot, slot_size, name, true);
+}
+
+// One row of the entry point table, so the loader loop below stays a loop.
+struct ProcSlot {
+  void* slot;
+  size_t size;
+  const char* name;
+};
 
 void release();
 bool bring_up(EGLDisplay display, bool wants_surface, const char* label);
@@ -106,7 +126,60 @@ bool query_context_info() {
 
 }  // namespace
 
+namespace {
+
+// Entry points M1 needs to move bytes: buffers, shaders and programs.
+constexpr ProcSlot kBufferProcs[] = {
+    {&f.GenBuffers, sizeof(f.GenBuffers), "glGenBuffers"},
+    {&f.DeleteBuffers, sizeof(f.DeleteBuffers), "glDeleteBuffers"},
+    {&f.BindBuffer, sizeof(f.BindBuffer), "glBindBuffer"},
+    {&f.BufferData, sizeof(f.BufferData), "glBufferData"},
+    {&f.BufferSubData, sizeof(f.BufferSubData), "glBufferSubData"},
+    {&f.GetBufferSubData, sizeof(f.GetBufferSubData), "glGetBufferSubData"},
+    {&f.BindBufferBase, sizeof(f.BindBufferBase), "glBindBufferBase"},
+    {&f.BindBufferRange, sizeof(f.BindBufferRange), "glBindBufferRange"},
+    {&f.CopyBufferSubData, sizeof(f.CopyBufferSubData), "glCopyBufferSubData"},
+    {&f.CreateShader, sizeof(f.CreateShader), "glCreateShader"},
+    {&f.ShaderSource, sizeof(f.ShaderSource), "glShaderSource"},
+    {&f.CompileShader, sizeof(f.CompileShader), "glCompileShader"},
+    {&f.GetShaderiv, sizeof(f.GetShaderiv), "glGetShaderiv"},
+    {&f.GetShaderInfoLog, sizeof(f.GetShaderInfoLog), "glGetShaderInfoLog"},
+    {&f.DeleteShader, sizeof(f.DeleteShader), "glDeleteShader"},
+    {&f.CreateProgram, sizeof(f.CreateProgram), "glCreateProgram"},
+    {&f.AttachShader, sizeof(f.AttachShader), "glAttachShader"},
+    {&f.LinkProgram, sizeof(f.LinkProgram), "glLinkProgram"},
+    {&f.GetProgramiv, sizeof(f.GetProgramiv), "glGetProgramiv"},
+    {&f.GetProgramInfoLog, sizeof(f.GetProgramInfoLog), "glGetProgramInfoLog"},
+    {&f.DeleteProgram, sizeof(f.DeleteProgram), "glDeleteProgram"},
+    {&f.UseProgram, sizeof(f.UseProgram), "glUseProgram"},
+    {&f.Finish, sizeof(f.Finish), "glFinish"},
+    {&f.Flush, sizeof(f.Flush), "glFlush"},
+};
+
+// Compute dispatch.  Absent on anything before GL 4.3, which is a supported
+// configuration rather than a broken one.
+constexpr ProcSlot kComputeProcs[] = {
+    {&f.DispatchCompute, sizeof(f.DispatchCompute), "glDispatchCompute"},
+    {&f.MemoryBarrier, sizeof(f.MemoryBarrier), "glMemoryBarrier"},
+};
+
+template <size_t N>
+bool load_all(const ProcSlot (&procs)[N]) {
+  bool all = true;
+  for (const ProcSlot& p : procs)
+    all &= try_load_proc(p.slot, p.size, p.name);
+  return all;
+}
+
+}  // namespace
+
 const ContextInfo& info() { return g_info; }
+
+bool make_current() {
+  if (g_context == EGL_NO_CONTEXT || g_display == EGL_NO_DISPLAY)
+    return false;
+  return eglMakeCurrent(g_display, g_surface, g_surface, g_context) == EGL_TRUE;
+}
 
 bool create_headless() {
   if (g_attempted)
@@ -318,8 +391,49 @@ bool finish_setup() {
   if (!query_context_info())
     return false;
 
-  if (f.GetError && f.GetError() != kGlNoError)
+  if (f.GetError && f.GetError() != kNoError)
     KNIZ_WARN("GL error set while querying context info");
+
+  // Compute shaders and shader storage blocks became core in 4.3.  The version
+  // string is the authority here, not the presence of the entry points: a
+  // driver will happily hand out glDispatchCompute on a context that is not
+  // allowed to call it.
+  const bool version_supports_compute =
+      g_info.major > 4 || (g_info.major == 4 && g_info.minor >= 3);
+
+  const bool bytes_ok = load_all(kBufferProcs);
+  const bool compute_ok = load_all(kComputeProcs);
+  g_info.compute_capable = version_supports_compute && bytes_ok && compute_ok;
+
+  if (!bytes_ok) {
+    KNIZ_ERR("this OpenGL context is missing buffer or program entry points; "
+             "Kniz cannot work with it");
+    return false;
+  }
+
+  if (!g_info.compute_capable) {
+    KNIZ_INFO("compute is unavailable: OpenGL %d.%d context, and compute "
+              "shaders need 4.3; buffers will still work",
+              g_info.major, g_info.minor);
+  }
+
+  if (g_info.compute_capable) {
+    gl::Int alignment = 0;
+    f.GetIntegerv(static_cast<Enum>(kGlShaderStorageBufferOffsetAlignment),
+                  &alignment);
+    g_info.ssbo_offset_alignment = alignment;
+
+    // Vulkan caps minStorageBufferOffsetAlignment at 256 and so does OpenGL, so
+    // a driver that wants more than 256 leaves some legal Vulkan offsets
+    // unrepresentable.  Say so once, here, rather than once per failed bind.
+    if (alignment > 256) {
+      KNIZ_WARN(
+          "this driver requires shader storage buffer offsets to be a multiple "
+          "of %d, but Vulkan caps minStorageBufferOffsetAlignment at 256; "
+          "offsets in between cannot be expressed and will be refused",
+          alignment);
+    }
+  }
 
   g_info.valid = true;
   g_ok = true;
@@ -328,6 +442,10 @@ bool finish_setup() {
             g_info.core ? "core" : "compatibility",
             g_surfaceless ? " (surfaceless)" : "", g_info.renderer.c_str(),
             g_info.version.c_str());
+  if (g_info.compute_capable)
+    KNIZ_INFO("compute shaders available; shader storage buffer offset "
+              "alignment %d",
+              g_info.ssbo_offset_alignment);
   return true;
 }
 

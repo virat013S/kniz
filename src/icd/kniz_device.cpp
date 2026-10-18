@@ -1,11 +1,14 @@
 // Device level Vulkan commands.
 //
-// At M0 this is a small set: create/destroy, dispatch lookup, and the queue
-// handle.  Everything command-buffer related lands in M1.
+// The table below is the device half of the entry point surface.  It is one
+// flat table, and both vkGetDeviceProcAddr and the instance level resolver read
+// it: applications and tooling do ask for device commands through
+// vkGetInstanceProcAddr, so the device commands have to be reachable from both
+// without being listed twice.  See kniz_icd.cpp for how the instance table says
+// so.
 //
-// Note the deliberate split: the commands below live in namespace kniz with
-// external linkage because kniz_icd.cpp references them by name when building
-// the instance level entry point table.  Only the table itself is internal.
+// The commands themselves live in namespace kniz with external linkage because
+// this table references them by name.  Only the table is internal.
 
 #include "kniz_common.h"
 #include "kniz_device.h"
@@ -27,14 +30,80 @@ PFN_vkVoidFunction as_entry(Fn fn) {
   return reinterpret_cast<PFN_vkVoidFunction>(fn);
 }
 
-// Declared in kniz_device.h, defined below.  This is the only reason those
-// definitions cannot be file-local.
 const Entry kEntries[] = {
+    // Device lifetime and queues.
     {"vkCreateDevice", as_entry(CreateDevice)},
     {"vkDestroyDevice", as_entry(DestroyDevice)},
     {"vkGetDeviceQueue", as_entry(GetDeviceQueue)},
     {"vkDeviceWaitIdle", as_entry(DeviceWaitIdle)},
     {"vkQueueWaitIdle", as_entry(QueueWaitIdle)},
+
+    // vkGetDeviceProcAddr itself.  The loader resolves this through
+    // vk_icdGetInstanceProcAddr while assembling its dispatch tables, so
+    // leaving it out of both tables makes the loader abandon vkCreateInstance
+    // with VK_ERROR_INITIALIZATION_FAILED and nothing to explain why.
+    {"vkGetDeviceProcAddr", as_entry(GetDeviceProcAddr)},
+
+    // Buffers and memory.
+    {"vkCreateBuffer", as_entry(CreateBuffer)},
+    {"vkDestroyBuffer", as_entry(DestroyBuffer)},
+    {"vkGetBufferMemoryRequirements", as_entry(GetBufferMemoryRequirements)},
+    {"vkAllocateMemory", as_entry(AllocateMemory)},
+    {"vkFreeMemory", as_entry(FreeMemory)},
+    {"vkBindBufferMemory", as_entry(BindBufferMemory)},
+    {"vkMapMemory", as_entry(MapMemory)},
+    {"vkUnmapMemory", as_entry(UnmapMemory)},
+    {"vkFlushMappedMemoryRanges", as_entry(FlushMappedMemoryRanges)},
+    {"vkInvalidateMappedMemoryRanges", as_entry(InvalidateMappedMemoryRanges)},
+
+    // Descriptors.
+    {"vkCreateDescriptorSetLayout", as_entry(CreateDescriptorSetLayout)},
+    {"vkDestroyDescriptorSetLayout", as_entry(DestroyDescriptorSetLayout)},
+    {"vkCreatePipelineLayout", as_entry(CreatePipelineLayout)},
+    {"vkDestroyPipelineLayout", as_entry(DestroyPipelineLayout)},
+    {"vkCreateDescriptorPool", as_entry(CreateDescriptorPool)},
+    {"vkDestroyDescriptorPool", as_entry(DestroyDescriptorPool)},
+    {"vkResetDescriptorPool", as_entry(ResetDescriptorPool)},
+    {"vkAllocateDescriptorSets", as_entry(AllocateDescriptorSets)},
+    {"vkFreeDescriptorSets", as_entry(FreeDescriptorSets)},
+    {"vkUpdateDescriptorSets", as_entry(UpdateDescriptorSets)},
+
+    // Shader modules and pipelines.
+    {"vkCreateShaderModule", as_entry(CreateShaderModule)},
+    {"vkDestroyShaderModule", as_entry(DestroyShaderModule)},
+    {"vkCreateComputePipelines", as_entry(CreateComputePipelines)},
+    {"vkCreateGraphicsPipelines", as_entry(CreateGraphicsPipelines)},
+    {"vkDestroyPipeline", as_entry(DestroyPipeline)},
+    {"vkCreatePipelineCache", as_entry(CreatePipelineCache)},
+    {"vkDestroyPipelineCache", as_entry(DestroyPipelineCache)},
+    {"vkGetPipelineCacheData", as_entry(GetPipelineCacheData)},
+    {"vkMergePipelineCaches", as_entry(MergePipelineCaches)},
+
+    // Command buffers.
+    {"vkCreateCommandPool", as_entry(CreateCommandPool)},
+    {"vkDestroyCommandPool", as_entry(DestroyCommandPool)},
+    {"vkResetCommandPool", as_entry(ResetCommandPool)},
+    {"vkAllocateCommandBuffers", as_entry(AllocateCommandBuffers)},
+    {"vkFreeCommandBuffers", as_entry(FreeCommandBuffers)},
+    {"vkBeginCommandBuffer", as_entry(BeginCommandBuffer)},
+    {"vkEndCommandBuffer", as_entry(EndCommandBuffer)},
+    {"vkResetCommandBuffer", as_entry(ResetCommandBuffer)},
+    {"vkCmdBindPipeline", as_entry(CmdBindPipeline)},
+    {"vkCmdBindDescriptorSets", as_entry(CmdBindDescriptorSets)},
+    {"vkCmdPushConstants", as_entry(CmdPushConstants)},
+    {"vkCmdPipelineBarrier", as_entry(CmdPipelineBarrier)},
+    {"vkCmdDispatch", as_entry(CmdDispatch)},
+    {"vkCmdFillBuffer", as_entry(CmdFillBuffer)},
+    {"vkCmdUpdateBuffer", as_entry(CmdUpdateBuffer)},
+    {"vkCmdCopyBuffer", as_entry(CmdCopyBuffer)},
+
+    // Submission and synchronisation.
+    {"vkQueueSubmit", as_entry(QueueSubmit)},
+    {"vkCreateFence", as_entry(CreateFence)},
+    {"vkDestroyFence", as_entry(DestroyFence)},
+    {"vkResetFences", as_entry(ResetFences)},
+    {"vkGetFenceStatus", as_entry(GetFenceStatus)},
+    {"vkWaitForFences", as_entry(WaitForFences)},
 };
 
 }  // namespace
@@ -170,19 +239,31 @@ VKAPI_ATTR void VKAPI_CALL GetDeviceQueue(VkDevice deviceHandle,
   *pQueue = to_handle(&device->queue);
 }
 
-// M0 performs no GPU work: vkQueueSubmit does not exist yet and the GL context
-// is only ever touched on the calling thread.  Both of these therefore have
-// nothing to wait for.  They become real once M1 introduces submission and
-// fences.
+// Work in Kniz is finished by the time vkQueueSubmit returns, so an idle wait
+// has nothing of its own to wait for.  What it can still do is push any GL work
+// the driver has buffered, which is worth doing at a point the application has
+// explicitly asked to synchronise with.
+static void drain_gl() {
+  if (gl::f.Finish == nullptr)
+    return;
+  if (!gl::make_current())
+    return;
+  gl::f.Finish();
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL DeviceWaitIdle(VkDevice deviceHandle) {
   if (from_handle(deviceHandle) == nullptr)
     return VK_ERROR_INITIALIZATION_FAILED;
+  drain_gl();
   return VK_SUCCESS;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL QueueWaitIdle(VkQueue queueHandle) {
-  if (from_handle(queueHandle) == nullptr)
+  Queue* queue = from_handle(queueHandle);
+  if (queue == nullptr)
     return VK_ERROR_INITIALIZATION_FAILED;
+  (void)queue;
+  drain_gl();
   return VK_SUCCESS;
 }
 

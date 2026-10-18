@@ -1,0 +1,34 @@
+#version 450
+
+// M1 test shader: out[i] = in[i] * 3 + 7, in 32-bit unsigned arithmetic.
+//
+// Deliberately trivial.  The point of the milestone test is the plumbing --
+// SPIR-V to GLSL, (set, binding) onto GL binding points, buffer contents round
+// tripping through the emulated memory model -- and a shader with any real
+// arithmetic in it would make a failure ambiguous between the plumbing and the
+// maths.  32-bit unsigned arithmetic is exact and wraps identically in GLSL and
+// in the C++ reference, so the comparison is bit for bit rather than
+// approximate.
+//
+// The compiled form is checked in beside this file.  Regenerate with:
+//
+//   glslangValidator -V -o scale.comp.spv scale.comp
+//
+// -V means Vulkan semantics, which is what a Vulkan application produces; the
+// OpenGL semantics mode would emit different resource decorations and would not
+// be testing the path the driver actually takes.
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Input {
+    uint values[];
+} input_data;
+
+layout(set = 0, binding = 1, std430) writeonly buffer Output {
+    uint values[];
+} output_data;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    output_data.values[index] = input_data.values[index] * 3u + 7u;
+}

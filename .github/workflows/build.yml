@@ -98,9 +98,17 @@ jobs:
             vulkaninfo --summary 2>&1 | grep -vE '^kniz: ' || true
 
   # ---------------------------------------------------------------------------
-  # A build with every optional dependency path disabled, to prove the system
-  # package route works on its own.  Fedora ships vulkan-headers, so this
-  # configuration must resolve everything without network access to GitHub.
+  # A build with every optional dependency path disabled.
+  #
+  # The point of this job is not "it always succeeds" but "the system package
+  # route is tried, and when it cannot satisfy a dependency the configure step
+  # says which one and why instead of quietly reaching for the network".
+  #
+  # Vulkan-Headers is resolvable from Fedora's packages, but SPIRV-Cross usually
+  # is not: Fedora and Arch both build it with SPIRV_CROSS_SHARED, exporting
+  # only the C API, so the C++ GLSL backend this project compiles against is
+  # absent from the package.  Refusing to configure is therefore the expected
+  # outcome here, and the job asserts that the refusal names the right thing.
   # ---------------------------------------------------------------------------
   no-fetch:
     name: no-fetch (system packages only)
@@ -119,12 +127,42 @@ jobs:
           mesa-libEGL-devel vulkan-headers
 
       - name: Configure without FetchContent
-        run: >
-          cmake -S . -B build -G Ninja
-          -DCMAKE_BUILD_TYPE=RelWithDebInfo
-          -DKNIZ_FETCH_DEPS=OFF
-          -DKNIZ_BUILD_TESTS=OFF
-          -DKNIZ_WERROR=ON
+        id: configure
+        run: |
+          set +e
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DKNIZ_FETCH_DEPS=OFF \
+            -DKNIZ_BUILD_TESTS=OFF \
+            -DKNIZ_WERROR=ON > configure.log 2>&1
+          status=$?
+          cat configure.log
+
+          if [ "$status" -eq 0 ]; then
+            # A distribution that does ship the C++ targets gets all the way
+            # through, which is the better outcome and worth building.
+            echo "system packages satisfied every dependency"
+            echo "configured=yes" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Refusing is fine.  Refusing for an unexplained reason is not: that
+          # would be the silent fallback this flag exists to prevent.  The check
+          # is that the failure came from the dependency resolver and named the
+          # dependency it could not satisfy -- whichever one that turns out to
+          # be, since which packages a distribution ships is exactly the thing
+          # this job must not assume.
+          if ! grep -q "KNIZ_FETCH_DEPS=OFF" configure.log; then
+            echo "::error::configure failed somewhere other than the dependency resolver"
+            exit 1
+          fi
+          if ! grep -Eq "Vulkan-Headers|SPIRV-Cross" configure.log; then
+            echo "::error::configure refused without naming the dependency it wanted"
+            exit 1
+          fi
+          echo "configure refused and explained which dependency it could not find"
+          echo "configured=no" >> "$GITHUB_OUTPUT"
 
       - name: Build
+        if: steps.configure.outputs.configured == 'yes'
         run: cmake --build build
