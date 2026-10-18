@@ -79,8 +79,41 @@ with `-DKNIZ_FETCH_DEPS=OFF` or `ON`.
 
 ## Running
 
-The loader resolves the manifest's `library_path` relative to the manifest's own
-directory, so in a build tree the manifest sits next to the library:
+The easiest way is the launcher at the top of the tree. It builds if it needs to,
+finds the manifest, and prints a status report when given no command:
+
+```sh
+./kniz                       # build if needed, then report status
+./kniz vulkaninfo --summary  # run any Vulkan program on Kniz
+./kniz --log 3 vkcube        # the same, with trace logging
+```
+
+Run with no arguments, `./kniz` executes `kniz-info`, which reports what the ICD
+gives an application and how much of Vulkan is actually implemented:
+
+```
+Instance
+  vkCreateInstance       ok
+  physical devices       1
+
+Device
+  name                   Kniz on Mesa Intel(R) HD Graphics 4400 (HSW GT2)
+  vendorID               0x4b4e  (Kniz)
+  apiVersion             1.0.0
+  device extensions      0
+
+What is implemented
+  loader handshake, instance/device yes  M0
+  properties, limits, memory model yes  M0
+  compute dispatch                 no   M1
+  render passes, pipelines, draws  no   M2
+  swapchain / window presentation  no   M3
+```
+
+The launcher only sets `VK_ICD_FILENAMES` and `KNIZ_LOG`, so you can always do the
+same by hand. The loader resolves the manifest's `library_path` relative to the
+manifest's own directory, which is why the manifest is copied next to the built
+library:
 
 ```sh
 VK_ICD_FILENAMES=$PWD/build/src/kniz_icd.json vulkaninfo --summary
@@ -120,6 +153,8 @@ See the note in [`docs/DESIGN.md`](docs/DESIGN.md).
 src/icd/     the ICD: bootstrap, object model, GL backend
 icd/         ICD manifest installed for loader discovery
 tests/       lifecycle test, driven through the loader
+tools/       kniz-info, the status report
+kniz         the launcher (top of tree)
 docs/        design notes and the fidelity budget
 ```
 

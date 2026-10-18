@@ -1,0 +1,204 @@
+#!/usr/bin/env bash
+#
+# kniz -- run a program with Kniz as its Vulkan driver.
+#
+# Kniz implements only part of Vulkan so far (see docs/DESIGN.md), so today this
+# is mostly a way to watch the driver come up, and to see exactly where a real
+# Vulkan program stops.  With no command it reports status.
+#
+# Usage:
+#   kniz                      build if needed, then report status
+#   kniz --check              report status only
+#   kniz <program> [args...]  run <program> on Kniz
+#
+# Options:
+#   -c, --check       report status and exit
+#   -b, --build       force a rebuild first
+#   -B, --no-build    never build automatically
+#   -l, --log <0-4>   Kniz log level, 0=error .. 4=trace (default 2)
+#   -i, --icd <path>  use a specific ICD manifest
+#   -q, --quiet       do not print the banner
+#   -h, --help        this text
+#
+# Environment:
+#   KNIZ_ICD          default for --icd
+#   KNIZ_LOG          default for --log
+#   KNIZ_BUILD_DIR    build directory (default: <repo>/build)
+
+set -euo pipefail
+
+self="$(readlink -f -- "${BASH_SOURCE[0]}")"
+here="$(dirname -- "$self")"
+
+log_level="${KNIZ_LOG:-2}"
+icd="${KNIZ_ICD:-}"
+build_dir="${KNIZ_BUILD_DIR:-$here/build}"
+build=auto
+do_check=0
+quiet=0
+
+die() {
+  printf 'kniz: %s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  sed -n '3,26p' "$self" | sed -e 's/^# \{0,1\}//'
+}
+
+# ---------------------------------------------------------------------------
+# Finding things
+# ---------------------------------------------------------------------------
+
+# The loader resolves a manifest's library_path relative to the manifest's own
+# directory, so a usable manifest is one that has libkniz.so beside it.
+find_icd() {
+  local candidate
+  if [[ -n "$icd" ]]; then
+    [[ -f "$icd" ]] || die "--icd: no such file: $icd"
+    printf '%s\n' "$(readlink -f -- "$icd")"
+    return 0
+  fi
+
+  for candidate in \
+    "$here/kniz_icd.json" \
+    "$build_dir/src/kniz_icd.json" \
+    "$here/../lib/kniz_icd.json" \
+    "$here/../lib64/kniz_icd.json" \
+    "$here"/../lib/*/kniz_icd.json
+  do
+    if [[ -f "$candidate" ]]; then
+      printf '%s\n' "$(readlink -f -- "$candidate")"
+      return 0
+    fi
+  done
+  return 1
+}
+
+find_info() {
+  local candidate
+  for candidate in "$here/kniz-info" "$build_dir/tools/kniz-info"; do
+    if [[ -x "$candidate" ]]; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+build_kniz() {
+  if [[ ! -f "$here/CMakeLists.txt" ]]; then
+    return 1  # installed copy: nothing to build from
+  fi
+  if ! command -v cmake >/dev/null 2>&1; then
+    printf 'kniz: cmake is not installed; cannot build\n' >&2
+    return 1
+  fi
+
+  local generator=()
+  if command -v ninja >/dev/null 2>&1; then
+    generator=(-G Ninja)
+  fi
+
+  printf 'kniz: building into %s\n' "$build_dir" >&2
+  if ! cmake -S "$here" -B "$build_dir" ${generator[@]+"${generator[@]}"} \
+       -DCMAKE_BUILD_TYPE=RelWithDebInfo >&2; then
+    return 1
+  fi
+  if ! cmake --build "$build_dir" >&2; then
+    return 1
+  fi
+  return 0
+}
+
+explain_missing_icd() {
+  cat >&2 <<EOF
+kniz: no ICD manifest found.
+
+Looked for kniz_icd.json in:
+  $build_dir/src/
+  $here/
+  $here/../lib/  (and lib64, and multiarch subdirectories)
+
+Build it first:
+  cmake -S "$here" -B "$build_dir" && cmake --build "$build_dir"
+
+or point at a manifest directly:
+  KNIZ_ICD=/path/to/kniz_icd.json $0
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------------------------
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -c|--check) do_check=1; shift ;;
+    -b|--build) build=force; shift ;;
+    -B|--no-build) build=never; shift ;;
+    -q|--quiet) quiet=1; shift ;;
+    -l|--log)
+      [[ $# -ge 2 ]] || die "--log needs a level (0-4)"
+      log_level="$2"; shift 2 ;;
+    --log=*) log_level="${1#*=}"; shift ;;
+    -i|--icd)
+      [[ $# -ge 2 ]] || die "--icd needs a path"
+      icd="$2"; shift 2 ;;
+    --icd=*) icd="${1#*=}"; shift ;;
+    --) shift; break ;;
+    -*) die "unknown option: $1 (try --help)" ;;
+    *) break ;;
+  esac
+done
+
+program=("$@")
+if [[ ${#program[@]} -eq 0 ]]; then
+  do_check=1
+fi
+
+if [[ ! "$log_level" =~ ^[0-4]$ ]]; then
+  die "--log must be 0, 1, 2, 3 or 4 (got '$log_level')"
+fi
+
+# ---------------------------------------------------------------------------
+# Locate the driver, building it if that is what it takes
+# ---------------------------------------------------------------------------
+
+icd_path=""
+if [[ "$build" != never ]]; then
+  if [[ "$build" == force ]] || ! icd_path="$(find_icd)"; then
+    build_kniz || die "build failed"
+    icd_path="$(find_icd)" || { explain_missing_icd; exit 1; }
+  fi
+else
+  icd_path="$(find_icd)" || { explain_missing_icd; exit 1; }
+fi
+
+lib="$(dirname -- "$icd_path")/libkniz.so"
+[[ -e "$lib" ]] || die "manifest found at $icd_path but $(basename -- "$lib") is missing beside it"
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+
+if [[ "$do_check" == 1 ]]; then
+  if info="$(find_info)"; then
+    VK_ICD_FILENAMES="$icd_path" KNIZ_LOG="$log_level" "$info"
+    status=$?
+    printf '\nTry it with a real program:\n'
+    printf '  %s vulkaninfo --summary\n' "$0"
+    exit "$status"
+  fi
+
+  printf 'kniz: %s (kniz-info not built)\n' "$icd_path"
+  exit 0
+fi
+
+if [[ "$quiet" == 0 ]]; then
+  printf 'kniz: %s\n' "${program[0]}" >&2
+  printf 'kniz: ICD %s\n' "$icd_path" >&2
+fi
+
+exec env VK_ICD_FILENAMES="$icd_path" KNIZ_LOG="$log_level" "${program[@]}"
