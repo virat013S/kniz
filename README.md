@@ -37,9 +37,10 @@ The honest, reachable goal:
 
 ## Status
 
-**M1 complete.** Kniz registers as a Vulkan ICD, the loader hands it an instance
-and a device, it brings up a real OpenGL context to back them, and it can now run
-a compute shader over storage buffers. It does not render anything yet.
+**M2a complete.** Kniz registers as a Vulkan ICD, the loader hands it an instance
+and a device, it brings up a real OpenGL context to back them, and it can run a
+compute shader over storage buffers and move image contents to and from buffers.
+It does not render anything yet.
 
 Working today:
 
@@ -51,11 +52,23 @@ Working today:
   `vkCmdCopyBuffer`
 - SPIR-V → GLSL, compute pipelines, descriptor sets, dispatch, submission and
   fences — verified numerically against a CPU reference, not merely exercised
+- Images and image views, image memory requirements and binding,
+  `vkCmdClearColorImage`, `vkCmdCopyBufferToImage`, `vkCmdCopyImageToBuffer` —
+  verified by byte-exact round trips, not merely exercised
 
-Not implemented: uniform buffers, push constants, textures and samplers, images,
-render passes, graphics pipelines, presentation. Each is refused with a specific
-error at the point the application reveals it needs one, rather than accepted and
-silently ignored. Next is M2, offscreen graphics.
+Not implemented: uniform buffers, push constants, samplers, render passes,
+graphics pipelines, presentation. Each is refused with a specific error at the
+point the application reveals it needs one, rather than accepted and silently
+ignored. Two refusals are permanent rather than pending, and both are argued in
+[`docs/DESIGN.md`](docs/DESIGN.md):
+
+- `VK_IMAGE_TILING_LINEAR` — a linear image's layout is observable and OpenGL's
+  storage layout is not it.
+- Mapping a `VkDeviceMemory` that an image is bound to — an image is a GL
+  texture, so the allocation does not hold its pixels.
+
+Next is M2b, offscreen graphics: render pass → framebuffer, pipeline → program, a
+triangle into an image compared against a reference.
 
 ## Building
 
@@ -115,25 +128,36 @@ Device
   device extensions      0
 
 What is implemented
-  loader handshake, instance/device yes  M0
-  properties, limits, memory model yes  M0
-  buffers and memory objects       yes  M1
-  SPIR-V -> GLSL translation       yes  M1
-  descriptor sets (storage buffers) yes  M1
-  compute dispatch                 yes  M1
-  uniform buffers, push constants  no   M2
-  render passes, pipelines, draws  no   M2
-  swapchain / window presentation  no   M3
-  fences, queries, timestamps      no   M4
+  loader handshake, instance/device    yes  M0
+  properties, limits, memory model     yes  M0
+  buffers and memory objects           yes  M1
+  SPIR-V -> GLSL translation           yes  M1
+  descriptor sets (storage buffers)    yes  M1
+  compute dispatch                     yes  M1
+  images, image views, memory binding  yes  M2a
+  images: clear, upload, readback      yes  M2a
+  linear tiling (layout is observable) no   never planned
+  images: storage, input attachments   no   not implemented
+  mapping an image's allocation        no   impossible, see DESIGN.md
+  uniform buffers, push constants      no   M2b
+  render passes, pipelines, draws      no   M2b
+  samplers and textures in shaders     no   M2b
+  swapchain / window presentation      no   M3
+  fences, queries, timestamps          no   M4
 ```
 
-The launcher only sets `VK_ICD_FILENAMES` and `KNIZ_LOG`, so you can always do the
-same by hand. The loader resolves the manifest's `library_path` relative to the
+The launcher sets `VK_ICD_FILENAMES`, `VK_DRIVER_FILES` and `KNIZ_LOG`, so you can
+always do the same by hand. Both manifest variables are set on purpose: the loader
+prefers `VK_DRIVER_FILES` and then *ignores* `VK_ICD_FILENAMES`, so a machine that
+pins a vendor driver with the newer variable would otherwise send every program to
+the system's own Vulkan driver. The launcher also prints which variable is in
+force. The loader resolves the manifest's `library_path` relative to the
 manifest's own directory, which is why the manifest is copied next to the built
 library:
 
 ```sh
-VK_ICD_FILENAMES=$PWD/build/src/kniz_icd.json vulkaninfo --summary
+VK_ICD_FILENAMES=$PWD/build/src/kniz_icd.json \
+VK_DRIVER_FILES=$PWD/build/src/kniz_icd.json vulkaninfo --summary
 ```
 
 Expected output:
@@ -157,7 +181,7 @@ Set `KNIZ_LOG=0..4` (`error`..`trace`) to control logging; the default is `2`.
 ctest --test-dir build --output-on-failure
 ```
 
-Two tests, both driven through the **real Vulkan loader** rather than by calling
+Three tests, all driven through the **real Vulkan loader** rather than by calling
 the ICD directly. That is deliberate: the most damaging class of ICD bug — a
 dispatchable object that does not reserve its first word for the loader's
 dispatch pointer — is invisible when the ICD is called directly, and produces a
@@ -171,6 +195,13 @@ See the note in [`docs/DESIGN.md`](docs/DESIGN.md).
   wrong buffer — produces plausible numbers rather than an error. It also covers
   `vkCmdFillBuffer`, `vkCmdUpdateBuffer` and `vkCmdCopyBuffer`, and asserts that a
   graphics pipeline is *refused* rather than accepted and ignored.
+- `image` — uploads a 64×32 image from a buffer and reads it back, requiring the
+  bytes to be identical (M2a). The pattern varies along both axes, so a flip or a
+  transposed stride cannot survive it. It also clears an image and requires the
+  exact texels the float clear value denotes, copies a sub-rectangle out of a
+  buffer whose rows are deliberately padded, and asserts the refusals hold —
+  including that mapping an allocation an image is bound to fails rather than
+  handing back a pointer to bytes that are not the image.
 
 The shader the second test uses is checked in twice: as GLSL, and as the compiled
 SPIR-V an application would actually submit. The command that regenerates the

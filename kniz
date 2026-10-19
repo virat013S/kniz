@@ -183,9 +183,20 @@ lib="$(dirname -- "$icd_path")/libkniz.so"
 # Report
 # ---------------------------------------------------------------------------
 
+# Both loader variables are set to the same manifest.  VK_ICD_FILENAMES is the
+# name the loader has always used, and VK_DRIVER_FILES is the newer one -- and
+# when both are present the loader prefers VK_DRIVER_FILES, ignoring the other
+# entirely.  A machine that pins a vendor driver that way would otherwise run the
+# program against the system driver, which is the one thing this script exists to
+# prevent.  Setting both is therefore what makes "always Kniz" true rather than
+# usually true.
+export VK_ICD_FILENAMES="$icd_path"
+export VK_DRIVER_FILES="$icd_path"
+export KNIZ_LOG="$log_level"
+
 if [[ "$do_check" == 1 ]]; then
   if info="$(find_info)"; then
-    VK_ICD_FILENAMES="$icd_path" KNIZ_LOG="$log_level" "$info"
+    "$info"
     status=$?
     printf '\nTry it with a real program:\n'
     printf '  %s vulkaninfo --summary\n' "$0"
@@ -201,4 +212,5 @@ if [[ "$quiet" == 0 ]]; then
   printf 'kniz: ICD %s\n' "$icd_path" >&2
 fi
 
-exec env VK_ICD_FILENAMES="$icd_path" KNIZ_LOG="$log_level" "${program[@]}"
+exec env VK_ICD_FILENAMES="$icd_path" VK_DRIVER_FILES="$icd_path" \
+  KNIZ_LOG="$log_level" "${program[@]}"

@@ -44,6 +44,11 @@ struct ContextInfo {
   // export glDispatchCompute on a context that is not allowed to call it.
   bool compute_capable = false;
 
+  // Textures and, later, framebuffers: the image half of the backend.  False on
+  // a context that cannot back a Vulkan image, in which case image creation is
+  // refused with a message rather than producing something that does not render.
+  bool texture_capable = false;
+
   // GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT.  Reported to applications as
   // minStorageBufferOffsetAlignment, and checked when a descriptor is bound:
   // Vulkan caps that limit at 256 while GL's own minimum is also 256, so if the
@@ -119,9 +124,47 @@ struct Functions {
   void (*MemoryBarrier)(Uint barriers) = nullptr;
   void (*Finish)() = nullptr;
   void (*Flush)() = nullptr;
+
+  // ---- M2: textures -------------------------------------------------------
+  //
+  // Vulkan images become GL textures.  Unlike buffers there is no host mirror:
+  // a texture's storage is defined by GL and does not correspond to any layout
+  // Vulkan describes, so all writes and reads go through commands.  See
+  // kniz_image.cpp.
+  void (*GenTextures)(Size n, Uint* textures) = nullptr;
+  void (*DeleteTextures)(Size n, const Uint* textures) = nullptr;
+  void (*BindTexture)(Enum target, Uint texture) = nullptr;
+  void (*ActiveTexture)(Enum texture) = nullptr;
+  void (*TexParameteri)(Enum target, Enum pname, Int param) = nullptr;
+  void (*TexStorage2D)(Enum target, Size levels, Enum internalformat, Size width,
+                       Size height) = nullptr;
+  void (*TexSubImage2D)(Enum target, Int level, Int xoffset, Int yoffset,
+                        Size width, Size height, Enum format, Enum type,
+                        const void* pixels) = nullptr;
+  void (*GetTexImage)(Enum target, Int level, Enum format, Enum type,
+                      void* pixels) = nullptr;
+  void (*ClearTexImage)(Enum texture, Int level, Enum format, Enum type,
+                        const void* data) = nullptr;
+  void (*PixelStorei)(Enum pname, Int param) = nullptr;
 };
 
 extern Functions f;
+
+// GL reports one error at a time and keeps reporting it until it is read, so a
+// single check after a sequence of calls can be blamed on the wrong call.
+// Draining first and reporting everything found is the only way to attribute a
+// failure to it, and returning whether anything was found lets a caller that has
+// to distrust its own result act on it.
+bool report_errors(const char* where);
+
+// GL's size parameters are signed; a Vulkan size is unsigned and one the
+// application has already validated against an object can still exceed what a
+// pointer difference can represent.  Saturating is not a silent truncation: no
+// GL call could name such a size anyway.
+inline SizePtr as_size_ptr(uint64_t bytes) {
+  constexpr uint64_t kMax = static_cast<uint64_t>(PTRDIFF_MAX);
+  return static_cast<SizePtr>(bytes > kMax ? kMax : bytes);
+}
 
 // ---------------------------------------------------------------------------
 // GL tokens used by the backend
@@ -156,5 +199,56 @@ inline constexpr Enum kInfoLogLength = 0x8B84;
 
 inline constexpr Enum kNoError = 0;
 inline constexpr Uint kAllBarrierBits = 0xFFFFFFFFu;
+
+// ---- M2: textures ---------------------------------------------------------
+//
+// Sized internal formats are what glTexStorage2D wants; the external formats
+// and types are what reads and writes use.  Both are needed because GL keeps
+// them separate and the round trip has to use the same pair on both sides.
+
+inline constexpr Enum kTexture2D = 0x0DE1;
+inline constexpr Enum kTexture0 = 0x84C0;
+inline constexpr Enum kMaxTextureSize = 0x0D33;
+
+inline constexpr Enum kTextureMinFilter = 0x2801;
+inline constexpr Enum kTextureMagFilter = 0x2800;
+inline constexpr Enum kTextureWrapS = 0x2802;
+inline constexpr Enum kTextureWrapT = 0x2803;
+inline constexpr Int kNearest = 0x2600;
+inline constexpr Int kLinear = 0x2601;
+inline constexpr Int kClampToEdge = 0x812F;
+inline constexpr Enum kTextureBaseLevel = 0x813C;
+inline constexpr Enum kTextureMaxLevel = 0x813D;
+
+inline constexpr Enum kUnpackAlignment = 0x0CF5;
+inline constexpr Enum kUnpackRowLength = 0x0CF2;
+inline constexpr Enum kPackAlignment = 0x0D05;
+
+inline constexpr Enum kR8 = 0x8229;
+inline constexpr Enum kRg8 = 0x822B;
+inline constexpr Enum kRgb8 = 0x8051;
+inline constexpr Enum kRgba8 = 0x8058;
+inline constexpr Enum kSrgb8Alpha8 = 0x8C43;
+inline constexpr Enum kR32f = 0x822E;
+inline constexpr Enum kRgba16f = 0x881A;
+inline constexpr Enum kRgba32f = 0x8814;
+inline constexpr Enum kDepthComponent16 = 0x81A5;
+inline constexpr Enum kDepthComponent24 = 0x81A6;
+inline constexpr Enum kDepthComponent32f = 0x8CAC;
+inline constexpr Enum kDepth24Stencil8 = 0x88F0;
+
+inline constexpr Enum kRed = 0x1903;
+inline constexpr Enum kRg = 0x8227;
+inline constexpr Enum kRgb = 0x1907;
+inline constexpr Enum kRgba = 0x1908;
+inline constexpr Enum kDepthComponent = 0x1902;
+inline constexpr Enum kDepthStencil = 0x84F9;
+inline constexpr Enum kUnsignedByte = 0x1401;
+inline constexpr Enum kUnsignedShort = 0x1403;
+inline constexpr Enum kUnsignedInt = 0x1405;
+inline constexpr Enum kFloat = 0x1406;
+inline constexpr Enum kHalfFloat = 0x140B;
+inline constexpr Enum kBgra = 0x80E1;
+inline constexpr Enum kUnsignedInt248 = 0x84FA;
 
 }  // namespace kniz::gl

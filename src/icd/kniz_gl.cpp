@@ -163,6 +163,22 @@ constexpr ProcSlot kComputeProcs[] = {
     {&f.MemoryBarrier, sizeof(f.MemoryBarrier), "glMemoryBarrier"},
 };
 
+// Textures, for the image half of the backend.  glTexStorage2D is 4.2,
+// glClearTexImage is 4.4 and glGetTexImage returned to the core profile in 4.5,
+// so 4.5 is the floor for the set as a whole.
+constexpr ProcSlot kTextureProcs[] = {
+    {&f.GenTextures, sizeof(f.GenTextures), "glGenTextures"},
+    {&f.DeleteTextures, sizeof(f.DeleteTextures), "glDeleteTextures"},
+    {&f.BindTexture, sizeof(f.BindTexture), "glBindTexture"},
+    {&f.ActiveTexture, sizeof(f.ActiveTexture), "glActiveTexture"},
+    {&f.TexParameteri, sizeof(f.TexParameteri), "glTexParameteri"},
+    {&f.TexStorage2D, sizeof(f.TexStorage2D), "glTexStorage2D"},
+    {&f.TexSubImage2D, sizeof(f.TexSubImage2D), "glTexSubImage2D"},
+    {&f.GetTexImage, sizeof(f.GetTexImage), "glGetTexImage"},
+    {&f.ClearTexImage, sizeof(f.ClearTexImage), "glClearTexImage"},
+    {&f.PixelStorei, sizeof(f.PixelStorei), "glPixelStorei"},
+};
+
 template <size_t N>
 bool load_all(const ProcSlot (&procs)[N]) {
   bool all = true;
@@ -174,6 +190,20 @@ bool load_all(const ProcSlot (&procs)[N]) {
 }  // namespace
 
 const ContextInfo& info() { return g_info; }
+
+bool report_errors(const char* where) {
+  if (f.GetError == nullptr)
+    return false;
+  bool found = false;
+  for (int i = 0; i < 8; ++i) {
+    const Enum error = f.GetError();
+    if (error == kNoError)
+      break;
+    KNIZ_ERR("OpenGL error 0x%04x (%s)", error, where);
+    found = true;
+  }
+  return found;
+}
 
 bool make_current() {
   if (g_context == EGL_NO_CONTEXT || g_display == EGL_NO_DISPLAY)
@@ -403,12 +433,26 @@ bool finish_setup() {
 
   const bool bytes_ok = load_all(kBufferProcs);
   const bool compute_ok = load_all(kComputeProcs);
+  const bool textures_ok = load_all(kTextureProcs);
   g_info.compute_capable = version_supports_compute && bytes_ok && compute_ok;
+
+  // glTexStorage2D is 4.2, glClearTexImage 4.4 and glGetTexImage only returned
+  // to the core profile in 4.5, so 4.5 is the floor for the texture set.
+  const bool version_supports_textures =
+      g_info.major > 4 || (g_info.major == 4 && g_info.minor >= 5);
+  g_info.texture_capable = version_supports_textures && textures_ok;
 
   if (!bytes_ok) {
     KNIZ_ERR("this OpenGL context is missing buffer or program entry points; "
              "Kniz cannot work with it");
     return false;
+  }
+
+  if (!g_info.texture_capable) {
+    KNIZ_INFO("images are unavailable: textures need OpenGL 4.5 and this is a "
+              "%d.%d context%s; buffers and compute still work",
+              g_info.major, g_info.minor,
+              textures_ok ? "" : " without the required entry points");
   }
 
   if (!g_info.compute_capable) {
@@ -446,6 +490,9 @@ bool finish_setup() {
     KNIZ_INFO("compute shaders available; shader storage buffer offset "
               "alignment %d",
               g_info.ssbo_offset_alignment);
+  if (g_info.texture_capable)
+    KNIZ_INFO("images available: textures, with glTexStorage2D, glClearTexImage "
+              "and glGetTexImage");
   return true;
 }
 

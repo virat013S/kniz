@@ -47,6 +47,8 @@ inline constexpr uint64_t kPipelineCacheMagic = 0x4B4E495A50434143ull;   // KNIZ
 inline constexpr uint64_t kCommandPoolMagic = 0x4B4E495A43504F4Full;     // KNIZCPOO
 inline constexpr uint64_t kCommandBufferMagic = 0x4B4E495A434D4442ull;   // KNIZCMDB
 inline constexpr uint64_t kFenceMagic = 0x4B4E495A46454E43ull;           // KNIZFENC
+inline constexpr uint64_t kImageMagic = 0x4B4E495A494D4147ull;           // KNIZIMAG
+inline constexpr uint64_t kImageViewMagic = 0x4B4E495A49565757ull;       // KNIZIVWW
 
 struct Instance;
 struct PhysicalDevice;
@@ -64,6 +66,8 @@ struct CommandPool;
 struct CommandBuffer;
 struct Fence;
 struct PipelineCache;
+struct Image;
+struct ImageView;
 
 // ---------------------------------------------------------------------------
 // Objects
@@ -158,6 +162,20 @@ struct Device {
   std::vector<Buffer*> buffers;
 };
 
+// True when the device is backed by a live GL context.  Every device entry point
+// that is about to touch GL asks this first, so a missing context is reported
+// once, in the same words, instead of surfacing later as an unattributable GL
+// error or a crash.
+inline bool device_can_run_gl(Device* device) {
+  if (device == nullptr)
+    return false;
+  if (!device->instance->gl_ready) {
+    KNIZ_ERR("no OpenGL context is available");
+    return false;
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // M1 objects
 // ---------------------------------------------------------------------------
@@ -191,6 +209,11 @@ struct DeviceMemory {
   // changed re-uploads when this no longer matches what it last uploaded.
   uint64_t version = 0;
   uint32_t map_count = 0;
+
+  // Images bound to this allocation.  An image is not mirrored into `host`, so
+  // mapping an allocation that holds one would hand the application a pointer to
+  // bytes that are not the image.  vkMapMemory refuses when this is non-zero.
+  uint32_t images_bound = 0;
 };
 
 struct Buffer {
@@ -304,6 +327,13 @@ struct RecordedCommand {
     // in order with an explicit memory barrier.  Dropping it would be wrong, so
     // it is recorded and replayed as glMemoryBarrier.
     Barrier,
+
+    // M2.  Image work is recorded with its own fields rather than reusing the
+    // buffer ones: a clear has no buffer at all, and a copy carries a list of
+    // regions.
+    ClearColorImage,
+    CopyBufferToImage,
+    CopyImageToBuffer,
   };
 
   Kind kind = Kind::Dispatch;
@@ -324,6 +354,20 @@ struct RecordedCommand {
   uint64_t size = 0;
   uint32_t data = 0;                 // FillBuffer's 32-bit pattern
   std::vector<uint8_t> bytes;        // UpdateBuffer's payload
+
+  // Image operations.
+  Image* image = nullptr;
+
+  // vkCmdClearColorImage's value, copied byte for byte out of the caller's
+  // VkClearColorValue.  Kept raw because which member of that union is meaningful
+  // depends on the image format, which is known at replay but not necessarily at
+  // record time.
+  uint8_t clear_value[16] = {};
+  VkImageSubresourceRange clear_range{};
+
+  // vkCmdCopyBufferToImage / vkCmdCopyImageToBuffer.  The buffer is `dst` for the
+  // first kind and `src` for the second, following the direction of the copy.
+  std::vector<VkBufferImageCopy> regions;
 };
 
 struct CommandPool {
@@ -369,6 +413,57 @@ struct Fence {
 struct PipelineCache {
   uint64_t magic = kPipelineCacheMagic;
   Device* device = nullptr;
+};
+
+// ---------------------------------------------------------------------------
+// M2 objects
+// ---------------------------------------------------------------------------
+
+// A VkImage is a GL texture.  Unlike a buffer there is deliberately no host
+// mirror: GL owns the texture's storage and its internal layout corresponds to
+// no layout Vulkan describes, so every read and write goes through a command.
+//
+// Two consequences, both enforced rather than documented and forgotten:
+// vkMapMemory refuses an allocation an image is bound to (see DeviceMemory), and
+// linear tiling is refused at vkCreateImage, because a linear image's layout is
+// something an application is entitled to observe and Kniz cannot provide it.
+struct Image {
+  uint64_t magic = kImageMagic;
+  Device* device = nullptr;
+
+  VkImageType type = VK_IMAGE_TYPE_2D;
+  VkFormat format = VK_FORMAT_UNDEFINED;
+  VkExtent3D extent{};
+  uint32_t mip_levels = 1;
+  uint32_t array_layers = 1;
+  VkImageUsageFlags usage = 0;
+
+  // Tracked for diagnostics only.  OpenGL has no image layouts, so a barrier
+  // that transitions one is recorded and replayed as a memory barrier.
+  VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+  gl::Uint gl_texture = 0;
+
+  DeviceMemory* memory = nullptr;
+  uint64_t memory_offset = 0;
+
+  // The GL texture's storage is created in vkBindImageMemory, which is the
+  // point where Vulkan makes the format and extent immutable.
+  bool storage_allocated = false;
+};
+
+// A view carries the format and subresource range a use of the image sees.  The
+// GL side is the image's texture; a view exists so that format mismatches are
+// caught where Vulkan says they are, and so that render passes and samplers have
+// somewhere to record which range they mean.
+struct ImageView {
+  uint64_t magic = kImageViewMagic;
+  Device* device = nullptr;
+  Image* image = nullptr;
+
+  VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D;
+  VkFormat format = VK_FORMAT_UNDEFINED;
+  VkImageSubresourceRange range{};
 };
 
 // ---------------------------------------------------------------------------
@@ -455,6 +550,14 @@ inline PipelineCache* from_handle(VkPipelineCache handle) {
   return detail::to_object<PipelineCache>(kPipelineCacheMagic, handle);
 }
 
+inline Image* from_handle(VkImage handle) {
+  return detail::to_object<Image>(kImageMagic, handle);
+}
+
+inline ImageView* from_handle(VkImageView handle) {
+  return detail::to_object<ImageView>(kImageViewMagic, handle);
+}
+
 // The inverse conversions are equally direct.
 inline VkInstance to_handle(Instance* object) {
   return reinterpret_cast<VkInstance>(object);
@@ -502,6 +605,14 @@ inline VkDescriptorSet to_handle(DescriptorSet* object) {
 
 inline VkPipeline to_handle(Pipeline* object) {
   return reinterpret_cast<VkPipeline>(object);
+}
+
+inline VkImage to_handle(Image* object) {
+  return reinterpret_cast<VkImage>(object);
+}
+
+inline VkImageView to_handle(ImageView* object) {
+  return reinterpret_cast<VkImageView>(object);
 }
 
 inline VkCommandPool to_handle(CommandPool* object) {

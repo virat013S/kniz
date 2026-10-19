@@ -84,7 +84,7 @@ void note(const char* fmt, ...) {
 void section(const char* title) { std::printf("\n%s\n", title); }
 
 void capability(const char* what, bool done, const char* milestone) {
-  std::printf("  %-32s %-4s %s\n", what, done ? "yes" : "no", milestone);
+  std::printf("  %-36s %-4s %s\n", what, done ? "yes" : "no", milestone);
 }
 
 // Append a flag name to a human readable list, separating with spaces.
@@ -186,18 +186,30 @@ int main(int argc, char** argv) {
   // context it brought up.  Do not override an explicit choice.
   setenv("KNIZ_LOG", "2", 0);
 
-  const char* icd = std::getenv("VK_ICD_FILENAMES");
+  // Which loader variable is actually in force.
+  //
+  // The loader prefers VK_DRIVER_FILES when it is set and then ignores
+  // VK_ICD_FILENAMES completely, so a report that named the other one would send
+  // the reader to fix a variable nothing is reading.
+  const char* icd_variable = "VK_DRIVER_FILES";
+  const char* icd = std::getenv(icd_variable);
+  if (icd == nullptr) {
+    icd_variable = "VK_ICD_FILENAMES";
+    icd = std::getenv(icd_variable);
+  }
   if (icd == nullptr) {
     std::fprintf(stderr,
-                 "\nVK_ICD_FILENAMES is not set, so this would exercise whatever "
-                 "Vulkan driver is installed\nrather than Kniz.  Use the 'kniz' "
-                 "launcher, or set it yourself:\n"
-                 "  VK_ICD_FILENAMES=/abs/path/to/kniz_icd.json kniz-info\n");
+                 "\nNeither VK_DRIVER_FILES nor VK_ICD_FILENAMES is set, so this "
+                 "would exercise whatever\nVulkan driver is installed rather than "
+                 "Kniz.  Use the 'kniz' launcher, or set\nthem yourself:\n"
+                 "  VK_ICD_FILENAMES=/abs/path/to/kniz_icd.json \\\n"
+                 "  VK_DRIVER_FILES=/abs/path/to/kniz_icd.json kniz-info\n");
     return 2;
   }
 
   section("Driver");
   field("manifest", "%s", icd);
+  field("selected by", "%s", icd_variable);
   field("loader", "%s", loader_name);
 
   void* loader = dlopen(loader_name, RTLD_NOW | RTLD_LOCAL);
@@ -302,7 +314,7 @@ int main(int argc, char** argv) {
   print_version("driverVersion", props.driverVersion);
 
   if (props.vendorID != 0x4B4E) {
-    note("NOT Kniz: VK_ICD_FILENAMES pointed at something else");
+    note("NOT Kniz: %s pointed at something else", icd_variable);
     ++g_problems;
   }
 
@@ -397,19 +409,27 @@ int main(int argc, char** argv) {
   capability("SPIR-V -> GLSL translation", true, "M1");
   capability("descriptor sets (storage buffers)", true, "M1");
   capability("compute dispatch", true, "M1");
-  capability("uniform buffers, push constants", false, "M2");
-  capability("render passes, pipelines, draws", false, "M2");
+  capability("images, image views, memory binding", true, "M2a");
+  capability("images: clear, upload, readback", true, "M2a");
+  capability("linear tiling (layout is observable)", false, "never planned");
+  capability("images: storage, input attachments", false, "not implemented");
+  capability("mapping an image's allocation", false, "impossible, see DESIGN.md");
+  capability("uniform buffers, push constants", false, "M2b");
+  capability("render passes, pipelines, draws", false, "M2b");
+  capability("samplers and textures in shaders", false, "M2b");
   capability("swapchain / window presentation", false, "M3");
   capability("fences, queries, timestamps", false, "M4");
 
   std::printf(
-      "\n  Nothing renders yet: compute dispatches work and their output has been\n"
-      "  checked against a CPU reference, but there are no render passes, no\n"
-      "  graphics pipelines, no images and no presentation.  Programs that only\n"
-      "  create a device, ask questions about it, or run a compute shader over\n"
-      "  buffers will work; anything that draws or presents is refused with a\n"
-      "  specific error rather than doing something surprising.  See\n"
-      "  docs/DESIGN.md for what OpenGL cannot express at all.\n"
+      "\n  Images exist and their contents move correctly -- a buffer to image and\n"
+      "  back again returns the bytes it was given, a clear lands as the exact\n"
+      "  texels its float value denotes, and a sub-rectangle copy respects both its\n"
+      "  offset and a padded buffer row length.  Nothing draws yet: there are no\n"
+      "  render passes, no graphics pipelines, no samplers and no presentation.\n"
+      "  Programs that only create a device, ask questions about it, run a compute\n"
+      "  shader over buffers, or move image contents will work; anything that draws\n"
+      "  or presents is refused with a specific error rather than doing something\n"
+      "  surprising.  See docs/DESIGN.md for what OpenGL cannot express at all.\n"
       "\n  The 'kniz:' lines above are the driver's own log, including the\n"
       "  OpenGL context it created to back this device.\n");
 

@@ -22,34 +22,12 @@
 namespace kniz {
 namespace {
 
-// Allocations are aligned to the offset alignment the driver reports, so that a
-// host pointer plus any legal buffer offset is still suitably aligned.
-constexpr uint64_t kAllocationAlignment = 256;
-
 // Does the GPU ever write this buffer?  Only those need reading back.  A buffer
 // that is merely a transfer source or a vertex input has nothing new to learn
 // from the GPU after a submission, and copying it back would be pure waste.
 bool gpu_writable(VkBufferUsageFlags usage) {
   return (usage & (VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                    VK_BUFFER_USAGE_TRANSFER_DST_BIT)) != 0;
-}
-
-// Clamp a byte count to what a GLsizeiptr can hold.  A buffer this large is not
-// reachable in practice (the heap is 1 GiB), but the conversion has to be
-// defined rather than merely unreachable.
-gl::SizePtr as_size_ptr(uint64_t bytes) {
-  constexpr uint64_t kMax = static_cast<uint64_t>(PTRDIFF_MAX);
-  return static_cast<gl::SizePtr>(bytes > kMax ? kMax : bytes);
-}
-
-bool device_can_run_gl(Device* device) {
-  if (device == nullptr)
-    return false;
-  if (!device->instance->gl_ready) {
-    KNIZ_ERR("no OpenGL context is available");
-    return false;
-  }
-  return true;
 }
 
 Buffer* find_buffer(Device* device, VkBuffer handle) {
@@ -282,7 +260,7 @@ VKAPI_ATTR VkResult VKAPI_CALL BindBufferMemory(VkDevice deviceHandle,
   // keeps a stale previous binding from being read by mistake.
   if (buffer->gl_name != 0) {
     gl::f.BindBuffer(gl::kArrayBuffer, buffer->gl_name);
-    gl::f.BufferData(gl::kArrayBuffer, as_size_ptr(buffer->size), nullptr,
+    gl::f.BufferData(gl::kArrayBuffer, gl::as_size_ptr(buffer->size), nullptr,
                      gl::kDynamicDraw);
     gl::f.BindBuffer(gl::kArrayBuffer, 0);
   }
@@ -321,6 +299,18 @@ VKAPI_ATTR VkResult VKAPI_CALL MapMemory(VkDevice deviceHandle,
              static_cast<unsigned long long>(offset),
              static_cast<unsigned long long>(offset + size),
              static_cast<unsigned long long>(memory->size));
+    return VK_ERROR_MEMORY_MAP_FAILED;
+  }
+
+  // An image is not mirrored into the host block -- it is an OpenGL texture --
+  // so a pointer into an allocation that holds one would show the application
+  // bytes that are not the image.  Refusing is the only honest answer; see
+  // kniz_image.h.
+  if (memory->images_bound > 0) {
+    KNIZ_ERR("this allocation holds %u image(s); an image is backed by an OpenGL "
+             "texture rather than by the host block, so mapping it would hand "
+             "back bytes that are not the image",
+             memory->images_bound);
     return VK_ERROR_MEMORY_MAP_FAILED;
   }
 
@@ -378,11 +368,17 @@ void sync_buffers_to_gl(Device* device) {
   for (Buffer* buffer : device->buffers) {
     if (buffer->memory == nullptr || buffer->gl_name == 0)
       continue;
-    if (buffer->uploaded_version == buffer->memory->version)
+
+    // A version match is not enough by itself.  Vulkan lets an application keep
+    // memory mapped across a submission and write through the pointer it is
+    // holding, so memory that is mapped right now may have changed since it was
+    // last uploaded, and the version only moves when it is unmapped.
+    if (buffer->uploaded_version == buffer->memory->version &&
+        buffer->memory->map_count == 0)
       continue;
 
     gl::f.BindBuffer(gl::kArrayBuffer, buffer->gl_name);
-    gl::f.BufferSubData(gl::kArrayBuffer, 0, as_size_ptr(buffer->size),
+    gl::f.BufferSubData(gl::kArrayBuffer, 0, gl::as_size_ptr(buffer->size),
                         buffer->memory->host + buffer->memory_offset);
     gl::f.BindBuffer(gl::kArrayBuffer, 0);
     buffer->uploaded_version = buffer->memory->version;
@@ -397,7 +393,7 @@ void sync_buffers_from_gl(Device* device) {
       continue;
 
     gl::f.BindBuffer(gl::kArrayBuffer, buffer->gl_name);
-    gl::f.GetBufferSubData(gl::kArrayBuffer, 0, as_size_ptr(buffer->size),
+    gl::f.GetBufferSubData(gl::kArrayBuffer, 0, gl::as_size_ptr(buffer->size),
                            buffer->memory->host + buffer->memory_offset);
     gl::f.BindBuffer(gl::kArrayBuffer, 0);
   }

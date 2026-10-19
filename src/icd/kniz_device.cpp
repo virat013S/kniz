@@ -97,6 +97,18 @@ const Entry kEntries[] = {
     {"vkCmdUpdateBuffer", as_entry(CmdUpdateBuffer)},
     {"vkCmdCopyBuffer", as_entry(CmdCopyBuffer)},
 
+    // Images.
+    {"vkCreateImage", as_entry(CreateImage)},
+    {"vkDestroyImage", as_entry(DestroyImage)},
+    {"vkGetImageMemoryRequirements", as_entry(GetImageMemoryRequirements)},
+    {"vkBindImageMemory", as_entry(BindImageMemory)},
+    {"vkGetImageSubresourceLayout", as_entry(GetImageSubresourceLayout)},
+    {"vkCreateImageView", as_entry(CreateImageView)},
+    {"vkDestroyImageView", as_entry(DestroyImageView)},
+    {"vkCmdClearColorImage", as_entry(CmdClearColorImage)},
+    {"vkCmdCopyBufferToImage", as_entry(CmdCopyBufferToImage)},
+    {"vkCmdCopyImageToBuffer", as_entry(CmdCopyImageToBuffer)},
+
     // Submission and synchronisation.
     {"vkQueueSubmit", as_entry(QueueSubmit)},
     {"vkCreateFence", as_entry(CreateFence)},

@@ -31,6 +31,7 @@ work we can do; anything in the "Lost" column is unfixable.
 | Descriptor sets, `VkDescriptorSetLayout` | flat GL binding points, rebound at draw | Partial |
 | Descriptor indexing / non-uniform indexing | `ARB_bindless_texture` | **Lost** on drivers without bindless (check `iris`) |
 | SPIR-V | GLSL via SPIRV-Cross | **Lossy** — no GLSL form for 8/16-bit types, storage-image formats, some group ops |
+| `VkImage` + `vkMapMemory` | GL texture, no host mirror | **Partial** — every read and write goes through a command; `LINEAR` tiling and mapping an image's allocation are refused outright (see §4, M2a) |
 | `VkImage` layout + barriers | none; implicit | Mostly harmless; emit `glMemoryBarrier` where coherence matters |
 | Fences, binary semaphores, events | `GLSync` / synchronous replay | Approximate |
 | Timeline semaphores | none | **Lost** — needs an emulation layer |
@@ -51,7 +52,10 @@ produces corruption that is far harder to debug than a clean
 
 Export `vk_icdGetInstanceProcAddr`, `vk_icdGetPhysicalDeviceProcAddr`,
 `vk_icdNegotiateLoaderICDInterfaceVersion` and `vkGetInstanceProcAddr`. Register
-via the manifest in `icd/kniz_icd.json` selected with `VK_ICD_FILENAMES`.
+via the manifest in `icd/kniz_icd.json`, selected with `VK_DRIVER_FILES` — and
+with `VK_ICD_FILENAMES` as well, since the loader honours the former and then
+ignores the latter, so setting only one of them is not enough on a machine that
+already pins a driver.
 
 We register as an *additional* device, not a replacement, so `vulkan-intel`
 stays available for comparison.
@@ -233,6 +237,15 @@ deliberately plain:
   package** — it `dlopen`s `libvulkan.so.1` and resolves `vkGetInstanceProcAddr`
   from it. So the only link-time requirement is the Vulkan headers, and the test
   is a real integration test rather than a unit test of our own code.
+- **Both loader selection variables are always set, never one.** The loader obeys
+  `VK_DRIVER_FILES` when it is set and then ignores `VK_ICD_FILENAMES` entirely.
+  A machine that pins a vendor driver with the newer variable therefore redirects
+  every test and every `kniz` invocation to the system's own driver no matter what
+  the older variable says, and the result looks like a driver bug rather than a
+  stale environment. The launcher, the tests and `kniz-info` all set and report
+  both, and the tests identify the driver by PCI vendor ID rather than trusting
+  any variable at all — a test that ran against ANV would otherwise pass while
+  proving nothing.
 - CI builds in Ubuntu, Fedora and Arch containers, which between them exercise
   both dependency paths, and additionally in `-DKNIZ_FETCH_DEPS=OFF` mode.
 
@@ -242,7 +255,8 @@ deliberately plain:
 |---|---|---|---|
 | **M0** ✅ | Manifest + `vk_icdGetInstanceProcAddr`; `vulkaninfo` lists our device; headless EGL context created | Loader handshake | `vulkaninfo --summary` shows Kniz |
 | **M1** ✅ | Offscreen compute end-to-end, checked against a CPU reference | SPIR-V→GLSL, memory, descriptors — the whole risky spine | numeric test passes |
-| **M2** | Offscreen graphics: render pass → FBO, PSO → program, triangle → image | Passes, pipelines, state | image matches reference |
+| **M2a** ✅ | Images: creation, memory binding, clear, upload, readback | The first object GL cannot mirror, and the layout asymmetry that comes with it | byte-exact round trip |
+| **M2b** | Offscreen graphics: render pass → FBO, PSO → program, triangle → image | Passes, pipelines, state | image matches reference |
 | **M3** | GLX/EGL swapchain | WSI | `vkcube` on screen |
 | **M4** | Fences, events, timestamps, queries | Correctness | sample suite runs |
 
@@ -281,10 +295,71 @@ fatal:
 M1 deliberately bundled the three scariest subsystems so failure was cheap and
 early.
 
-What M1 does *not* cover, and M2 has to add: uniform buffers, push constants,
-textures and samplers, images, render passes, graphics pipelines. All of them are
-refused with an explicit error today, at the earliest point the application
-reveals it needs one.
+M2 was split in two once it became clear that "images" and "drawing" share almost
+no machinery. **M2a** is images and the data movement to and from them; **M2b** is
+render passes, graphics pipelines and draws. M2a is done: its test
+(`tests/image.cpp`) round-trips a 64×32 image through a buffer and back and
+requires the bytes to be identical, clears an image and requires the exact texels
+the float clear value denotes, copies a sub-rectangle out of a buffer whose rows
+are deliberately padded and requires every texel inside it to be right and every
+texel outside it to be untouched, and asserts the refusals hold.
+
+Three things M2a settled, each of which changed the design:
+
+- **An image has no host mirror, and cannot have one.** A buffer's contents have a
+  single representation — bytes — so Kniz can keep a copy and shuffle it in and
+  out of GL around each submission. An image has two: the layout Vulkan
+  describes, and whatever GL stores, which is opaque and unspecified. There is no
+  mapping between them, so an image is backed *only* by its GL texture and every
+  read and write goes through a recorded command. Two consequences are therefore
+  enforced rather than documented and forgotten:
+  - `VK_IMAGE_TILING_LINEAR` is refused. A linear image's layout is *observable*
+    — `vkGetImageSubresourceLayout` exists to report it — and GL cannot be told to
+    use that layout, so the only honest answer is no. This removes host mirroring,
+    mapping, and subresource-layout fidelity problems in one stroke, at the cost
+    of a tiling that interactive applications do not use.
+  - `vkMapMemory` is refused when any image is bound to the allocation. The
+    allocation is still host memory; it just does not hold the image's pixels, so
+    a pointer into it would show the application bytes that are not the image.
+    Suballocating an image together with a buffer is consequently not yet
+    supported.
+- **No y flip is needed, and "fixing" that would be a bug.** Vulkan's framebuffer
+  origin is upper-left and GL's is lower-left, which sounds like a flip is
+  required somewhere; in the other direction, GL→Vulkan, which is Zink's problem,
+  it is. Here it is not. GL maps clip space to window coordinates as
+  `y_w = (y_d + 1) * h / 2` counted up from the lower left, Vulkan as
+  `y_f = (y_d + 1) * h / 2` counted down from the upper left, so *both* put
+  `y_d = -1` in row 0 of the image. GL's row 0 is its bottom row and Vulkan's is
+  its top row, but that is only a difference in which word describes it, and
+  everything that consumes these images — readback, and in time sampling and the
+  swapchain — does so through Vulkan's convention. Vulkan image row *r* and GL
+  texture row *r* hold the same content.
+- **The host mirror and the GL buffer object must be updated together.** The first
+  version of `vkCmdCopyImageToBuffer` wrote the copied bytes into the buffer's
+  host mirror and stopped there, on the reasoning that the mirror is what the
+  application maps. Submission then copies the GL buffer object back over the
+  mirror for every buffer the GPU may have written — and the object had never
+  been told about the bytes — so the readback returned zeros. Both representations
+  are now written. The general rule is worth stating because it will recur: *any*
+  command that produces bytes on the host side has to push them to the object as
+  well, or the next `sync_buffers_from_gl` will discard them.
+
+M2a also fixed a latent M1 bug that the same reasoning exposed: host writes made
+while memory is *mapped* were only noticed on unmap, because the version counter
+moved only then. Vulkan lets an application keep an allocation mapped across a
+submission and write through the pointer it holds, so submission now re-uploads
+any allocation that is mapped at all, whether or not its version changed.
+
+What M2a does *not* cover, and M2b has to add: uniform buffers, push constants,
+textures and samplers, render passes, framebuffers, graphics pipelines. All of
+them are refused with an explicit error today, at the earliest point the
+application reveals it needs one. M2a's own remaining costs, to be revisited:
+image-only allocations still allocate a full host block that the image does not
+use, a sub-region readback of a mip level costs a temporary of the whole level
+(`glGetTexImage` reads a level, not a rectangle), an sRGB view of a UNORM
+image is refused rather than silently sampled with the transfer function missing,
+and GL's filter and wrap state belongs to a texture while Vulkan's belongs to a
+sampler — a real difference that M2b has to place somewhere.
 
 ## 5. Non-goals
 

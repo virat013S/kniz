@@ -18,10 +18,12 @@
 // docs/DESIGN.md (ADR-1).
 
 #include "kniz_common.h"
+#include "kniz_image.h"
 #include "kniz_memory.h"
 #include "kniz_objects.h"
 
 #include <algorithm>
+#include <cstring>
 #include <new>
 #include <string>
 #include <vector>
@@ -34,11 +36,6 @@ namespace {
 // buffer from needing a matching host allocation.
 constexpr uint64_t kFillChunkBytes = 1u << 20;
 constexpr uint64_t kUpdateBufferMax = 65536;
-
-gl::SizePtr as_size_ptr(uint64_t bytes) {
-  constexpr uint64_t kMax = static_cast<uint64_t>(PTRDIFF_MAX);
-  return static_cast<gl::SizePtr>(bytes > kMax ? kMax : bytes);
-}
 
 bool recording(CommandBuffer* cmd, const char* what) {
   if (cmd == nullptr) {
@@ -58,26 +55,11 @@ bool recording(CommandBuffer* cmd, const char* what) {
 // Replay
 // ---------------------------------------------------------------------------
 
-// GL reports one error at a time and keeps reporting it until it is read, so a
-// single check after a sequence of calls can be fooled by an error that came
-// from somewhere earlier.  Draining first and reporting everything found is the
-// only way to attribute a failure to the right call.
-void report_gl_errors(const char* where) {
-  if (gl::f.GetError == nullptr)
-    return;
-  for (int i = 0; i < 8; ++i) {
-    const gl::Enum error = gl::f.GetError();
-    if (error == gl::kNoError)
-      return;
-    KNIZ_ERR("OpenGL error 0x%04x (%s)", error, where);
-  }
-}
-
 void replay_dispatch(const RecordedCommand& command) {
   Pipeline* pipeline = command.pipeline;
   gl::f.UseProgram(pipeline->program);
 
-  report_gl_errors("after glUseProgram");
+  gl::report_errors("after glUseProgram");
 
   // The pipeline layout decided, at creation, which GL binding point each
   // (set, binding) got; the shader was generated from the same table.  So this
@@ -137,15 +119,15 @@ void replay_dispatch(const RecordedCommand& command) {
     gl::f.BindBufferRange(gl::kShaderStorageBuffer, mapping.gl_index,
                           buffer->gl_name,
                           static_cast<gl::IntPtr>(binding.offset),
-                          as_size_ptr(range));
+                          gl::as_size_ptr(range));
   }
 
-  report_gl_errors("after binding descriptor sets");
+  gl::report_errors("after binding descriptor sets");
 
   gl::f.DispatchCompute(command.group_count[0], command.group_count[1],
                         command.group_count[2]);
 
-  report_gl_errors("after glDispatchCompute");
+  gl::report_errors("after glDispatchCompute");
 
   // Make the writes visible to everything that follows: a later fill, a copy,
   // the read back to the host, or the next dispatch.
@@ -162,7 +144,7 @@ void replay_fill(const RecordedCommand& command) {
     const uint64_t chunk = std::min(command.size - written, kFillChunkBytes);
     gl::f.BufferSubData(gl::kArrayBuffer,
                         static_cast<gl::IntPtr>(command.offset + written),
-                        as_size_ptr(chunk), scratch.data());
+                        gl::as_size_ptr(chunk), scratch.data());
     written += chunk;
   }
 
@@ -172,7 +154,7 @@ void replay_fill(const RecordedCommand& command) {
 void replay_update(const RecordedCommand& command) {
   gl::f.BindBuffer(gl::kArrayBuffer, command.dst->gl_name);
   gl::f.BufferSubData(gl::kArrayBuffer, static_cast<gl::IntPtr>(command.offset),
-                      as_size_ptr(command.size), command.bytes.data());
+                      gl::as_size_ptr(command.size), command.bytes.data());
   gl::f.BindBuffer(gl::kArrayBuffer, 0);
 }
 
@@ -190,11 +172,35 @@ void replay_copy(const RecordedCommand& command) {
   gl::f.CopyBufferSubData(
       gl::kCopyReadBuffer, gl::kCopyWriteBuffer,
       static_cast<gl::IntPtr>(command.src_offset),
-      static_cast<gl::IntPtr>(command.offset), as_size_ptr(command.size));
+      static_cast<gl::IntPtr>(command.offset), gl::as_size_ptr(command.size));
   gl::f.BindBuffer(gl::kCopyReadBuffer, 0);
   gl::f.BindBuffer(gl::kCopyWriteBuffer, 0);
 
   gl::f.MemoryBarrier(gl::kAllBarrierBits);
+}
+
+// The image commands.  Each reports its own failures internally; a copy that
+// fails partway stops, because writing half an image from data that is not
+// trustworthy is worse than not writing it.
+
+void replay_clear_image(const RecordedCommand& command) {
+  if (command.image == nullptr)
+    return;
+  image_clear(command.image, command.clear_range, command.clear_value);
+}
+
+void replay_copy_buffer_to_image(const RecordedCommand& command) {
+  for (const VkBufferImageCopy& region : command.regions) {
+    if (!image_write(command.src, command.image, region))
+      return;
+  }
+}
+
+void replay_copy_image_to_buffer(const RecordedCommand& command) {
+  for (const VkBufferImageCopy& region : command.regions) {
+    if (!image_read(command.dst, command.image, region))
+      return;
+  }
 }
 
 void replay(const CommandBuffer& cmd) {
@@ -217,6 +223,15 @@ void replay(const CommandBuffer& cmd) {
         break;
       case RecordedCommand::Kind::CopyBuffer:
         replay_copy(command);
+        break;
+      case RecordedCommand::Kind::ClearColorImage:
+        replay_clear_image(command);
+        break;
+      case RecordedCommand::Kind::CopyBufferToImage:
+        replay_copy_buffer_to_image(command);
+        break;
+      case RecordedCommand::Kind::CopyImageToBuffer:
+        replay_copy_image_to_buffer(command);
         break;
     }
   }
@@ -530,12 +545,19 @@ VKAPI_ATTR void VKAPI_CALL CmdPipelineBarrier(
   (void)pMemoryBarriers;
   (void)bufferMemoryBarrierCount;
   (void)pBufferMemoryBarriers;
-  (void)imageMemoryBarrierCount;
-  (void)pImageMemoryBarriers;
 
   CommandBuffer* cmd = from_handle(commandBuffer);
   if (!recording(cmd, "vkCmdPipelineBarrier"))
     return;
+
+  // The layout transitions are recorded on the images for diagnostics and
+  // otherwise dropped: OpenGL has no image layouts, and the ordering a barrier
+  // provides is what the recorded memory barrier below is for.
+  for (uint32_t i = 0; i < imageMemoryBarrierCount; ++i) {
+    Image* image = from_handle(pImageMemoryBarriers[i].image);
+    if (image != nullptr && image->device == cmd->device)
+      image->layout = pImageMemoryBarriers[i].newLayout;
+  }
 
   RecordedCommand command;
   command.kind = RecordedCommand::Kind::Barrier;
@@ -712,9 +734,135 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyBuffer(VkCommandBuffer commandBuffer,
 }
 
 // ---------------------------------------------------------------------------
-// Submission
+// Image commands
+//
+// Each of these records what it needs and defers the GL work to replay, matching
+// the buffer commands.  The one interesting difference is that they capture data
+// rather than just references: the clear value is copied out of the caller's
+// union, and a copy captures its whole region list, because Vulkan lets the
+// caller free both as soon as the recording call returns.
 // ---------------------------------------------------------------------------
 
+VKAPI_ATTR void VKAPI_CALL CmdClearColorImage(
+    VkCommandBuffer commandBuffer, VkImage imageHandle, VkImageLayout imageLayout,
+    const VkClearColorValue* pColor, uint32_t rangeCount,
+    const VkImageSubresourceRange* pRanges) {
+  CommandBuffer* cmd = from_handle(commandBuffer);
+  if (!recording(cmd, "vkCmdClearColorImage"))
+    return;
+
+  Image* image = from_handle(imageHandle);
+  if (image == nullptr) {
+    KNIZ_ERR("vkCmdClearColorImage was given something that is not a Kniz image");
+    return;
+  }
+  if ((image->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) == 0) {
+    KNIZ_ERR("vkCmdClearColorImage needs VK_IMAGE_USAGE_TRANSFER_DST_BIT on the "
+             "image");
+    return;
+  }
+  if (pColor == nullptr || pRanges == nullptr || rangeCount == 0)
+    return;
+
+  image->layout = imageLayout;
+
+  for (uint32_t i = 0; i < rangeCount; ++i) {
+    RecordedCommand command;
+    command.kind = RecordedCommand::Kind::ClearColorImage;
+    command.image = image;
+    command.clear_range = pRanges[i];
+
+    // Which member of VkClearColorValue the application filled in depends on the
+    // image's format's component class, so the bytes are taken as they are and
+    // interpreted at replay.  That is also why the buffer is exactly 16 bytes
+    // rather than a VkClearColorValue: replay has to be able to read it without
+    // knowing which member is live.
+    static_assert(sizeof(VkClearColorValue) == sizeof(command.clear_value),
+                  "a clear value must fit the recorded bytes");
+    std::memcpy(command.clear_value, pColor, sizeof(command.clear_value));
+
+    cmd->commands.push_back(std::move(command));
+  }
+}
+
+VKAPI_ATTR void VKAPI_CALL CmdCopyBufferToImage(
+    VkCommandBuffer commandBuffer, VkBuffer srcBuffer, VkImage dstImageHandle,
+    VkImageLayout dstImageLayout, uint32_t regionCount,
+    const VkBufferImageCopy* pRegions) {
+  CommandBuffer* cmd = from_handle(commandBuffer);
+  if (!recording(cmd, "vkCmdCopyBufferToImage"))
+    return;
+
+  Buffer* src = from_handle(srcBuffer);
+  Image* dst = from_handle(dstImageHandle);
+  if (src == nullptr || dst == nullptr) {
+    KNIZ_ERR("vkCmdCopyBufferToImage was given something that is not a Kniz "
+             "buffer or image");
+    return;
+  }
+  if ((src->usage & VK_BUFFER_USAGE_TRANSFER_SRC_BIT) == 0) {
+    KNIZ_ERR("vkCmdCopyBufferToImage needs VK_BUFFER_USAGE_TRANSFER_SRC_BIT on the "
+             "buffer");
+    return;
+  }
+  if ((dst->usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) == 0) {
+    KNIZ_ERR("vkCmdCopyBufferToImage needs VK_IMAGE_USAGE_TRANSFER_DST_BIT on the "
+             "image");
+    return;
+  }
+  if (pRegions == nullptr || regionCount == 0)
+    return;
+
+  dst->layout = dstImageLayout;
+
+  RecordedCommand command;
+  command.kind = RecordedCommand::Kind::CopyBufferToImage;
+  command.src = src;
+  command.image = dst;
+  command.regions.assign(pRegions, pRegions + regionCount);
+  cmd->commands.push_back(std::move(command));
+}
+
+VKAPI_ATTR void VKAPI_CALL CmdCopyImageToBuffer(
+    VkCommandBuffer commandBuffer, VkImage srcImageHandle, VkImageLayout srcImageLayout,
+    VkBuffer dstBuffer, uint32_t regionCount, const VkBufferImageCopy* pRegions) {
+  CommandBuffer* cmd = from_handle(commandBuffer);
+  if (!recording(cmd, "vkCmdCopyImageToBuffer"))
+    return;
+
+  Image* src = from_handle(srcImageHandle);
+  Buffer* dst = from_handle(dstBuffer);
+  if (src == nullptr || dst == nullptr) {
+    KNIZ_ERR("vkCmdCopyImageToBuffer was given something that is not a Kniz "
+             "buffer or image");
+    return;
+  }
+  if ((src->usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) == 0) {
+    KNIZ_ERR("vkCmdCopyImageToBuffer needs VK_IMAGE_USAGE_TRANSFER_SRC_BIT on the "
+             "image");
+    return;
+  }
+  if ((dst->usage & VK_BUFFER_USAGE_TRANSFER_DST_BIT) == 0) {
+    KNIZ_ERR("vkCmdCopyImageToBuffer needs VK_BUFFER_USAGE_TRANSFER_DST_BIT on the "
+             "buffer");
+    return;
+  }
+  if (pRegions == nullptr || regionCount == 0)
+    return;
+
+  src->layout = srcImageLayout;
+
+  RecordedCommand command;
+  command.kind = RecordedCommand::Kind::CopyImageToBuffer;
+  command.dst = dst;
+  command.image = src;
+  command.regions.assign(pRegions, pRegions + regionCount);
+  cmd->commands.push_back(std::move(command));
+}
+
+// ---------------------------------------------------------------------------
+// Submission
+// ---------------------------------------------------------------------------
 VKAPI_ATTR VkResult VKAPI_CALL QueueSubmit(VkQueue queueHandle, uint32_t submitCount,
                                            const VkSubmitInfo* pSubmits,
                                            VkFence fenceHandle) {

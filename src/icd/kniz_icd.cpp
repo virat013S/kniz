@@ -8,6 +8,7 @@
 #include "kniz_device.h"
 #include "kniz_entrypoints.h"
 #include "kniz_gl.h"
+#include "kniz_image.h"
 #include "kniz_objects.h"
 
 #include <atomic>
@@ -450,14 +451,44 @@ VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceImageFormatProperties(
     VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags,
     VkImageFormatProperties* pImageFormatProperties) {
   (void)physicalHandle;
-  (void)format;
-  (void)type;
-  (void)tiling;
-  (void)usage;
-  (void)flags;
-  if (pImageFormatProperties != nullptr)
-    std::memset(pImageFormatProperties, 0, sizeof(*pImageFormatProperties));
-  return VK_ERROR_FORMAT_NOT_SUPPORTED;
+  if (pImageFormatProperties == nullptr)
+    return VK_ERROR_FORMAT_NOT_SUPPORTED;
+  std::memset(pImageFormatProperties, 0, sizeof(*pImageFormatProperties));
+
+  // Being truthful matters more here than anywhere else in the driver.
+  // Applications pick their whole resource strategy from this answer, so an
+  // optimistic one produces a failure much later and much further from its
+  // cause.  The refusals below are exactly the ones vkCreateImage makes, so an
+  // application that asks first and creates second is told the same thing twice.
+  const ImageFormat* info = image_format(format);
+  if (info == nullptr)
+    return VK_ERROR_FORMAT_NOT_SUPPORTED;
+  if (type != VK_IMAGE_TYPE_2D || tiling != VK_IMAGE_TILING_OPTIMAL)
+    return VK_ERROR_FORMAT_NOT_SUPPORTED;
+  if ((flags & kUnimplementedImageFlags) != 0)
+    return VK_ERROR_FORMAT_NOT_SUPPORTED;
+  if ((usage & kUnimplementedImageUsage) != 0)
+    return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+  // 4096 is what fill_limits advertises as maxImageDimension2D.  The backend
+  // would accept more on most drivers -- vkCreateImage goes by GL's own query --
+  // but promising less than can be delivered is the safe direction, and answering
+  // here from the same number keeps the two from disagreeing.
+  const uint32_t dimension = 4096;
+  pImageFormatProperties->maxExtent.width = dimension;
+  pImageFormatProperties->maxExtent.height = dimension;
+  pImageFormatProperties->maxExtent.depth = 1;
+  pImageFormatProperties->maxArrayLayers = 1;
+  pImageFormatProperties->sampleCounts = VK_SAMPLE_COUNT_1_BIT;
+  pImageFormatProperties->maxResourceSize =
+      static_cast<VkDeviceSize>(dimension) * dimension * info->bytes_per_pixel;
+
+  // One level, not the thirteen a 4096 image could have.  Storage for every level
+  // is created, but nothing yet reads or writes any but the first: a copy refuses
+  // a level above zero and a sampler does not exist.  Advertising the full count
+  // would let an application build mip chains that are silently never filled in.
+  pImageFormatProperties->maxMipLevels = 1;
+  return VK_SUCCESS;
 }
 
 VKAPI_ATTR void VKAPI_CALL GetPhysicalDeviceSparseImageFormatProperties(

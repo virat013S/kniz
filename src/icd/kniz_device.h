@@ -244,4 +244,48 @@ VKAPI_ATTR VkResult VKAPI_CALL WaitForFences(VkDevice device, uint32_t fenceCoun
                                              const VkFence* pFences,
                                              VkBool32 waitAll, uint64_t timeout);
 
+// ---------------------------------------------------------------------------
+// M2: images
+// ---------------------------------------------------------------------------
+
+VKAPI_ATTR VkResult VKAPI_CALL CreateImage(
+    VkDevice device, const VkImageCreateInfo* pCreateInfo,
+    const VkAllocationCallbacks* pAllocator, VkImage* pImage);
+
+VKAPI_ATTR void VKAPI_CALL DestroyImage(VkDevice device, VkImage image,
+                                        const VkAllocationCallbacks* pAllocator);
+
+VKAPI_ATTR void VKAPI_CALL GetImageMemoryRequirements(
+    VkDevice device, VkImage image, VkMemoryRequirements* pMemoryRequirements);
+
+VKAPI_ATTR VkResult VKAPI_CALL BindImageMemory(VkDevice device, VkImage image,
+                                               VkDeviceMemory memory,
+                                               VkDeviceSize memoryOffset);
+
+VKAPI_ATTR void VKAPI_CALL GetImageSubresourceLayout(
+    VkDevice device, VkImage image, const VkImageSubresource* pSubresource,
+    VkSubresourceLayout* pLayout);
+
+VKAPI_ATTR VkResult VKAPI_CALL CreateImageView(
+    VkDevice device, const VkImageViewCreateInfo* pCreateInfo,
+    const VkAllocationCallbacks* pAllocator, VkImageView* pImageView);
+
+VKAPI_ATTR void VKAPI_CALL DestroyImageView(
+    VkDevice device, VkImageView imageView,
+    const VkAllocationCallbacks* pAllocator);
+
+VKAPI_ATTR void VKAPI_CALL CmdClearColorImage(
+    VkCommandBuffer commandBuffer, VkImage image, VkImageLayout imageLayout,
+    const VkClearColorValue* pColor, uint32_t rangeCount,
+    const VkImageSubresourceRange* pRanges);
+
+VKAPI_ATTR void VKAPI_CALL CmdCopyBufferToImage(
+    VkCommandBuffer commandBuffer, VkBuffer srcBuffer, VkImage dstImage,
+    VkImageLayout dstImageLayout, uint32_t regionCount,
+    const VkBufferImageCopy* pRegions);
+
+VKAPI_ATTR void VKAPI_CALL CmdCopyImageToBuffer(
+    VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout,
+    VkBuffer dstBuffer, uint32_t regionCount, const VkBufferImageCopy* pRegions);
+
 }  // namespace kniz

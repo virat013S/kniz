@@ -5,6 +5,7 @@ add_library(kniz SHARED
   icd/kniz_device.cpp
   icd/kniz_shader.cpp
   icd/kniz_memory.cpp
+  icd/kniz_image.cpp
   icd/kniz_descriptor.cpp
   icd/kniz_pipeline.cpp
   icd/kniz_command.cpp)
