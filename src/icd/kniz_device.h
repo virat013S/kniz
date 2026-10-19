@@ -288,4 +288,65 @@ VKAPI_ATTR void VKAPI_CALL CmdCopyImageToBuffer(
     VkCommandBuffer commandBuffer, VkImage srcImage, VkImageLayout srcImageLayout,
     VkBuffer dstBuffer, uint32_t regionCount, const VkBufferImageCopy* pRegions);
 
+// ---------------------------------------------------------------------------
+// M2b: drawing
+// ---------------------------------------------------------------------------
+
+VKAPI_ATTR VkResult VKAPI_CALL CreateRenderPass(
+    VkDevice device, const VkRenderPassCreateInfo* pCreateInfo,
+    const VkAllocationCallbacks* pAllocator, VkRenderPass* pRenderPass);
+
+VKAPI_ATTR void VKAPI_CALL DestroyRenderPass(
+    VkDevice device, VkRenderPass renderPass,
+    const VkAllocationCallbacks* pAllocator);
+
+VKAPI_ATTR VkResult VKAPI_CALL CreateFramebuffer(
+    VkDevice device, const VkFramebufferCreateInfo* pCreateInfo,
+    const VkAllocationCallbacks* pAllocator, VkFramebuffer* pFramebuffer);
+
+VKAPI_ATTR void VKAPI_CALL DestroyFramebuffer(
+    VkDevice device, VkFramebuffer framebuffer,
+    const VkAllocationCallbacks* pAllocator);
+
+VKAPI_ATTR void VKAPI_CALL CmdBeginRenderPass(
+    VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo* pRenderPassBegin,
+    VkSubpassContents contents);
+
+VKAPI_ATTR void VKAPI_CALL CmdEndRenderPass(VkCommandBuffer commandBuffer);
+
+VKAPI_ATTR void VKAPI_CALL CmdNextSubpass(VkCommandBuffer commandBuffer,
+                                          VkSubpassContents contents);
+
+VKAPI_ATTR void VKAPI_CALL CmdBindVertexBuffers(
+    VkCommandBuffer commandBuffer, uint32_t firstBinding, uint32_t bindingCount,
+    const VkBuffer* pBuffers, const VkDeviceSize* pOffsets);
+
+VKAPI_ATTR void VKAPI_CALL CmdBindIndexBuffer(VkCommandBuffer commandBuffer,
+                                              VkBuffer buffer,
+                                              VkDeviceSize offset,
+                                              VkIndexType indexType);
+
+VKAPI_ATTR void VKAPI_CALL CmdSetViewport(VkCommandBuffer commandBuffer,
+                                          uint32_t firstViewport,
+                                          uint32_t viewportCount,
+                                          const VkViewport* pViewports);
+
+VKAPI_ATTR void VKAPI_CALL CmdSetScissor(VkCommandBuffer commandBuffer,
+                                         uint32_t firstScissor,
+                                         uint32_t scissorCount,
+                                         const VkRect2D* pScissors);
+
+VKAPI_ATTR void VKAPI_CALL CmdDraw(VkCommandBuffer commandBuffer,
+                                   uint32_t vertexCount, uint32_t instanceCount,
+                                   uint32_t firstVertex, uint32_t firstInstance);
+
+VKAPI_ATTR void VKAPI_CALL CmdDrawIndexed(
+    VkCommandBuffer commandBuffer, uint32_t indexCount, uint32_t instanceCount,
+    uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance);
+
+VKAPI_ATTR void VKAPI_CALL CmdClearAttachments(
+    VkCommandBuffer commandBuffer, uint32_t attachmentCount,
+    const VkClearAttachment* pAttachments, uint32_t rectCount,
+    const VkClearRect* pRects);
+
 }  // namespace kniz

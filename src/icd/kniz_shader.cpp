@@ -47,11 +47,41 @@ std::string unsupported_feature(const spirv_cross::ShaderResources& resources) {
   return {};
 }
 
+const char* stage_name(VkShaderStageFlagBits stage) {
+  switch (stage) {
+    case VK_SHADER_STAGE_VERTEX_BIT:
+      return "vertex";
+    case VK_SHADER_STAGE_FRAGMENT_BIT:
+      return "fragment";
+    case VK_SHADER_STAGE_COMPUTE_BIT:
+      return "compute";
+    default:
+      return "unknown";
+  }
+}
+
+bool execution_model(VkShaderStageFlagBits stage, spv::ExecutionModel* model) {
+  switch (stage) {
+    case VK_SHADER_STAGE_VERTEX_BIT:
+      *model = spv::ExecutionModelVertex;
+      return true;
+    case VK_SHADER_STAGE_FRAGMENT_BIT:
+      *model = spv::ExecutionModelFragment;
+      return true;
+    case VK_SHADER_STAGE_COMPUTE_BIT:
+      *model = spv::ExecutionModelGLCompute;
+      return true;
+    default:
+      return false;
+  }
+}
+
 }  // namespace
 
-ShaderTranslation translate_compute(const std::vector<uint32_t>& spirv,
-                                    const std::string& entry_point,
-                                    const std::vector<GlBinding>& bindings) {
+ShaderTranslation translate_shader(const std::vector<uint32_t>& spirv,
+                                   const std::string& entry_point,
+                                   VkShaderStageFlagBits stage,
+                                   const std::vector<GlBinding>& bindings) {
   ShaderTranslation result;
 
   if (spirv.empty()) {
@@ -59,23 +89,42 @@ ShaderTranslation translate_compute(const std::vector<uint32_t>& spirv,
     return result;
   }
 
+  spv::ExecutionModel model = spv::ExecutionModelMax;
+  if (!execution_model(stage, &model)) {
+    result.error = std::string("a ") + stage_name(stage) +
+                   " stage is not one of the stages Kniz translates";
+    return result;
+  }
+
   try {
     spirv_cross::CompilerGLSL compiler(spirv);
 
-    if (entry_point != "main") {
-      // SPIRV-Cross translates the first entry point unless told otherwise, so
-      // an application that names a different one would silently get the wrong
-      // function.
-      compiler.set_entry_point(entry_point, spv::ExecutionModelGLCompute);
-    }
+    // Always named, even for "main".  The entry point's execution model is what
+    // tells SPIRV-Cross which stage it is emitting, and a module can hold more
+    // than one entry point, so leaving it to the default is a guess.
+    compiler.set_entry_point(entry_point.empty() ? "main" : entry_point, model);
 
     spirv_cross::CompilerGLSL::Options options;
-    // 4.50 is the first version in which compute shaders, shader storage blocks
-    // and the std430 layout this shader was written against are all core, so no
+    // 4.50 is the first version in which compute shaders, shader storage blocks,
+    // the std430 layout and explicit varying locations are all core, so no
     // extension pragmas are needed.
     options.version = 450;
     options.es = false;
     options.vulkan_semantics = false;
+
+    // Vulkan's clip space runs z from 0 to w and GL's from -w to w, so a vertex
+    // shader written for Vulkan would place its geometry in the near half of GL's
+    // depth range -- and geometry at z = w would sit exactly on GL's far plane,
+    // where clipping is at best undefined.  SPIRV-Cross rewrites
+    // gl_Position.z = 2 * z - w to fix that.
+    //
+    // The y axis is deliberately *not* flipped, and that is not an oversight: GL
+    // and Vulkan both map a vertex at y = -1 to row 0 of the image, so flipping
+    // would introduce the very mismatch this is meant to avoid.  See the note in
+    // docs/DESIGN.md.
+    options.vertex.fixup_clipspace = true;
+    options.vertex.flip_vert_y = false;
+
     compiler.set_common_options(options);
 
     const spirv_cross::ShaderResources resources =
@@ -83,9 +132,10 @@ ShaderTranslation translate_compute(const std::vector<uint32_t>& spirv,
 
     if (std::string missing = unsupported_feature(resources);
         !missing.empty()) {
-      result.error = "shader uses " + missing +
-                     ", which Kniz does not implement yet; M1 supports shader "
-                     "storage buffers only";
+      result.error = "the " + std::string(stage_name(stage)) +
+                     " shader uses " + missing +
+                     ", which Kniz does not implement yet; only shader storage "
+                     "buffers and vertex attributes are supported so far";
       return result;
     }
 

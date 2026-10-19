@@ -37,10 +37,11 @@ The honest, reachable goal:
 
 ## Status
 
-**M2a complete.** Kniz registers as a Vulkan ICD, the loader hands it an instance
+**M2b complete.** Kniz registers as a Vulkan ICD, the loader hands it an instance
 and a device, it brings up a real OpenGL context to back them, and it can run a
-compute shader over storage buffers and move image contents to and from buffers.
-It does not render anything yet.
+compute shader over storage buffers, move image contents to and from buffers, and
+draw untextured geometry into an image through a render pass and a graphics
+pipeline. It does not present anything to a window yet.
 
 Working today:
 
@@ -55,11 +56,16 @@ Working today:
 - Images and image views, image memory requirements and binding,
   `vkCmdClearColorImage`, `vkCmdCopyBufferToImage`, `vkCmdCopyImageToBuffer` —
   verified by byte-exact round trips, not merely exercised
+- Render passes, framebuffers, graphics pipelines, vertex input from one or two
+  buffers at once, indexed draws, dynamic viewport and scissor, and back-face
+  culling — verified against a CPU rasterisation of the same triangle, including
+  which way round the image came out and which winding the triangle has
 
-Not implemented: uniform buffers, push constants, samplers, render passes,
-graphics pipelines, presentation. Each is refused with a specific error at the
-point the application reveals it needs one, rather than accepted and silently
-ignored. Two refusals are permanent rather than pending, and both are argued in
+Not implemented: uniform buffers, push constants, samplers, depth and stencil
+attachments, blending, multisampling, instancing, geometry and tessellation
+stages, and presentation. Each is refused with a specific error at the point the
+application reveals it needs one, rather than accepted and silently ignored. Two
+refusals are permanent rather than pending, and both are argued in
 [`docs/DESIGN.md`](docs/DESIGN.md):
 
 - `VK_IMAGE_TILING_LINEAR` — a linear image's layout is observable and OpenGL's
@@ -67,8 +73,8 @@ ignored. Two refusals are permanent rather than pending, and both are argued in
 - Mapping a `VkDeviceMemory` that an image is bound to — an image is a GL
   texture, so the allocation does not hold its pixels.
 
-Next is M2b, offscreen graphics: render pass → framebuffer, pipeline → program, a
-triangle into an image compared against a reference.
+Next is M2c — uniform buffers and push constants — then M2d for samplers and
+textures, and M3 for a swapchain and a window.
 
 ## Building
 
@@ -134,16 +140,18 @@ What is implemented
   SPIR-V -> GLSL translation           yes  M1
   descriptor sets (storage buffers)    yes  M1
   compute dispatch                     yes  M1
-  images, image views, memory binding  yes  M2a
-  images: clear, upload, readback      yes  M2a
-  linear tiling (layout is observable) no   never planned
-  images: storage, input attachments   no   not implemented
-  mapping an image's allocation        no   impossible, see DESIGN.md
-  uniform buffers, push constants      no   M2b
-  render passes, pipelines, draws      no   M2b
-  samplers and textures in shaders     no   M2b
-  swapchain / window presentation      no   M3
-  fences, queries, timestamps          no   M4
+  images, image views, memory binding      yes  M2a
+  images: clear, upload, readback          yes  M2a
+  render passes, framebuffers, draws       yes  M2b
+  graphics pipelines and rasterisation     yes  M2b
+  linear tiling (layout is observable)     no   never planned
+  images: storage, input attachments       no   not implemented
+  mapping an image's allocation            no   impossible, see DESIGN.md
+  depth, stencil, blending, multisampling  no   M2b refused on purpose
+  uniform buffers, push constants          no   M2c
+  samplers and textures in shaders         no   M2d
+  swapchain / window presentation          no   M3
+  fences, queries, timestamps              no   M4
 ```
 
 The launcher sets `VK_ICD_FILENAMES`, `VK_DRIVER_FILES` and `KNIZ_LOG`, so you can
@@ -181,7 +189,7 @@ Set `KNIZ_LOG=0..4` (`error`..`trace`) to control logging; the default is `2`.
 ctest --test-dir build --output-on-failure
 ```
 
-Three tests, all driven through the **real Vulkan loader** rather than by calling
+Four tests, all driven through the **real Vulkan loader** rather than by calling
 the ICD directly. That is deliberate: the most damaging class of ICD bug — a
 dispatchable object that does not reserve its first word for the loader's
 dispatch pointer — is invisible when the ICD is called directly, and produces a
@@ -193,8 +201,8 @@ See the note in [`docs/DESIGN.md`](docs/DESIGN.md).
   elements against a C++ reference (M1). The comparison is exact rather than a
   tolerance, because the failure this guards against — a descriptor bound to the
   wrong buffer — produces plausible numbers rather than an error. It also covers
-  `vkCmdFillBuffer`, `vkCmdUpdateBuffer` and `vkCmdCopyBuffer`, and asserts that a
-  graphics pipeline is *refused* rather than accepted and ignored.
+  `vkCmdFillBuffer`, `vkCmdUpdateBuffer` and `vkCmdCopyBuffer`, and asserts that an
+  empty graphics pipeline is *refused* rather than accepted and ignored.
 - `image` — uploads a 64×32 image from a buffer and reads it back, requiring the
   bytes to be identical (M2a). The pattern varies along both axes, so a flip or a
   transposed stride cannot survive it. It also clears an image and requires the
@@ -202,11 +210,30 @@ See the note in [`docs/DESIGN.md`](docs/DESIGN.md).
   buffer whose rows are deliberately padded, and asserts the refusals hold —
   including that mapping an allocation an image is bound to fails rather than
   handing back a pointer to bytes that are not the image.
+- `draw` — draws a triangle into an image and reads it back (M2b). The three
+  vertices carry red, green and blue, the triangle is asymmetric about the
+  horizontal axis, and the colours it should produce are computed on the CPU from
+  barycentric coordinates of the same vertex data — so an upside-down image, a
+  transposed one, a swapped colour channel or a wrong interpolation all show up as
+  a numeric disagreement rather than as an image that still contains a triangle.
+  The same triangle is then produced five more ways: indexed, with the vertex
+  buffers bound at non-zero offsets and a negative base vertex; with a dynamic
+  viewport; with a render area covering half the framebuffer, which must leave the
+  other half untouched; once with back faces culled, which must keep the triangle,
+  and once with the winding called clockwise, which must remove it; and once
+  through a pipeline writing only two of its four colour channels. A separate
+  shader writes `gl_FragCoord` back out, so the rasteriser is asked where it thinks
+  each fragment is instead of being told — which is also what pins down the clip
+  space depth conversion, since a vertex written at Vulkan depth 0.25 has to read
+  back as 0.25 rather than as 0.625. The refusals — a second subpass, a depth
+  attachment, an input attachment, blending, a geometry stage, an integer vertex
+  format, a pipeline used with another render pass — are asserted too.
 
-The shader the second test uses is checked in twice: as GLSL, and as the compiled
-SPIR-V an application would actually submit. The command that regenerates the
-SPIR-V is recorded at the top of `tests/shaders/scale.comp`, and the compiled form
-is committed so that the test suite does not depend on `glslangValidator` being
+The shaders the tests use are checked in twice: as GLSL, and as the compiled
+SPIR-V an application would actually submit. The command that regenerates each
+SPIR-V file is recorded at the top of the GLSL it came from
+(`tests/shaders/scale.comp`, and the four that `draw` uses), and the compiled forms
+are committed so that the test suite does not depend on `glslangValidator` being
 installed.
 
 ## Layout

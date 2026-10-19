@@ -84,7 +84,7 @@ void note(const char* fmt, ...) {
 void section(const char* title) { std::printf("\n%s\n", title); }
 
 void capability(const char* what, bool done, const char* milestone) {
-  std::printf("  %-36s %-4s %s\n", what, done ? "yes" : "no", milestone);
+  std::printf("  %-40s %-4s %s\n", what, done ? "yes" : "no", milestone);
 }
 
 // Append a flag name to a human readable list, separating with spaces.
@@ -411,12 +411,14 @@ int main(int argc, char** argv) {
   capability("compute dispatch", true, "M1");
   capability("images, image views, memory binding", true, "M2a");
   capability("images: clear, upload, readback", true, "M2a");
+  capability("render passes, framebuffers, draws", true, "M2b");
+  capability("graphics pipelines and rasterisation", true, "M2b");
   capability("linear tiling (layout is observable)", false, "never planned");
   capability("images: storage, input attachments", false, "not implemented");
   capability("mapping an image's allocation", false, "impossible, see DESIGN.md");
-  capability("uniform buffers, push constants", false, "M2b");
-  capability("render passes, pipelines, draws", false, "M2b");
-  capability("samplers and textures in shaders", false, "M2b");
+  capability("depth, stencil, blending, multisampling", false, "M2b refused on purpose");
+  capability("uniform buffers, push constants", false, "M2c");
+  capability("samplers and textures in shaders", false, "M2d");
   capability("swapchain / window presentation", false, "M3");
   capability("fences, queries, timestamps", false, "M4");
 
@@ -424,12 +426,17 @@ int main(int argc, char** argv) {
       "\n  Images exist and their contents move correctly -- a buffer to image and\n"
       "  back again returns the bytes it was given, a clear lands as the exact\n"
       "  texels its float value denotes, and a sub-rectangle copy respects both its\n"
-      "  offset and a padded buffer row length.  Nothing draws yet: there are no\n"
-      "  render passes, no graphics pipelines, no samplers and no presentation.\n"
-      "  Programs that only create a device, ask questions about it, run a compute\n"
-      "  shader over buffers, or move image contents will work; anything that draws\n"
-      "  or presents is refused with a specific error rather than doing something\n"
-      "  surprising.  See docs/DESIGN.md for what OpenGL cannot express at all.\n"
+      "  offset and a padded buffer row length.  Lines and triangles are drawn into\n"
+      "  an image through a render pass, a graphics pipeline and one or two vertex\n"
+      "  buffers, and the result is checked against a CPU rasterisation of the same\n"
+      "  geometry rather than merely eyeballed.\n"
+      "\n  Not implemented yet, and refused with a specific error rather than\n"
+      "  approximated: depth and stencil, blending, multisampling, instancing,\n"
+      "  geometry and tessellation stages, more than one subpass or a depth\n"
+      "  attachment, uniform buffers, push constants, samplers, and presentation.\n"
+      "  Programs that create a device, ask questions about it, run a compute shader\n"
+      "  over buffers, move image contents, or draw untextured geometry will work.\n"
+      "  See docs/DESIGN.md for what OpenGL cannot express at all.\n"
       "\n  The 'kniz:' lines above are the driver's own log, including the\n"
       "  OpenGL context it created to back this device.\n");
 

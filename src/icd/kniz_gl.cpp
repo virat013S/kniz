@@ -179,6 +179,41 @@ constexpr ProcSlot kTextureProcs[] = {
     {&f.PixelStorei, sizeof(f.PixelStorei), "glPixelStorei"},
 };
 
+// Framebuffers, vertex arrays, draws and raster state.  Core in 3.0, so on any
+// context that got this far the only way these are missing is a broken stack --
+// which is exactly what the capability flag is for.
+constexpr ProcSlot kRenderProcs[] = {
+    {&f.GenFramebuffers, sizeof(f.GenFramebuffers), "glGenFramebuffers"},
+    {&f.DeleteFramebuffers, sizeof(f.DeleteFramebuffers), "glDeleteFramebuffers"},
+    {&f.BindFramebuffer, sizeof(f.BindFramebuffer), "glBindFramebuffer"},
+    {&f.FramebufferTexture2D, sizeof(f.FramebufferTexture2D),
+     "glFramebufferTexture2D"},
+    {&f.CheckFramebufferStatus, sizeof(f.CheckFramebufferStatus),
+     "glCheckFramebufferStatus"},
+    {&f.DrawBuffers, sizeof(f.DrawBuffers), "glDrawBuffers"},
+    {&f.ClearBufferfv, sizeof(f.ClearBufferfv), "glClearBufferfv"},
+    {&f.GenVertexArrays, sizeof(f.GenVertexArrays), "glGenVertexArrays"},
+    {&f.DeleteVertexArrays, sizeof(f.DeleteVertexArrays), "glDeleteVertexArrays"},
+    {&f.BindVertexArray, sizeof(f.BindVertexArray), "glBindVertexArray"},
+    {&f.EnableVertexAttribArray, sizeof(f.EnableVertexAttribArray),
+     "glEnableVertexAttribArray"},
+    {&f.DisableVertexAttribArray, sizeof(f.DisableVertexAttribArray),
+     "glDisableVertexAttribArray"},
+    {&f.VertexAttribPointer, sizeof(f.VertexAttribPointer),
+     "glVertexAttribPointer"},
+    {&f.DrawArrays, sizeof(f.DrawArrays), "glDrawArrays"},
+    {&f.DrawElements, sizeof(f.DrawElements), "glDrawElements"},
+    {&f.DrawElementsBaseVertex, sizeof(f.DrawElementsBaseVertex),
+     "glDrawElementsBaseVertex"},
+    {&f.Viewport, sizeof(f.Viewport), "glViewport"},
+    {&f.Scissor, sizeof(f.Scissor), "glScissor"},
+    {&f.Enable, sizeof(f.Enable), "glEnable"},
+    {&f.Disable, sizeof(f.Disable), "glDisable"},
+    {&f.CullFace, sizeof(f.CullFace), "glCullFace"},
+    {&f.FrontFace, sizeof(f.FrontFace), "glFrontFace"},
+    {&f.ColorMask, sizeof(f.ColorMask), "glColorMask"},
+};
+
 template <size_t N>
 bool load_all(const ProcSlot (&procs)[N]) {
   bool all = true;
@@ -434,6 +469,7 @@ bool finish_setup() {
   const bool bytes_ok = load_all(kBufferProcs);
   const bool compute_ok = load_all(kComputeProcs);
   const bool textures_ok = load_all(kTextureProcs);
+  const bool rendering_ok = load_all(kRenderProcs);
   g_info.compute_capable = version_supports_compute && bytes_ok && compute_ok;
 
   // glTexStorage2D is 4.2, glClearTexImage 4.4 and glGetTexImage only returned
@@ -441,6 +477,14 @@ bool finish_setup() {
   const bool version_supports_textures =
       g_info.major > 4 || (g_info.major == 4 && g_info.minor >= 5);
   g_info.texture_capable = version_supports_textures && textures_ok;
+
+  // Framebuffer objects and vertex array objects are core in 3.0, but the draw
+  // path also uses glDrawElementsBaseVertex, which arrived in 3.2, because
+  // vkCmdDrawIndexed's base vertex parameter has no earlier equivalent.  The
+  // floor is 3.2 for that reason rather than for the framebuffer objects.
+  const bool version_supports_rendering =
+      g_info.major > 3 || (g_info.major == 3 && g_info.minor >= 2);
+  g_info.render_capable = version_supports_rendering && rendering_ok;
 
   if (!bytes_ok) {
     KNIZ_ERR("this OpenGL context is missing buffer or program entry points; "
@@ -493,6 +537,9 @@ bool finish_setup() {
   if (g_info.texture_capable)
     KNIZ_INFO("images available: textures, with glTexStorage2D, glClearTexImage "
               "and glGetTexImage");
+  if (g_info.render_capable)
+    KNIZ_INFO("rendering available: framebuffer objects, vertex array objects, "
+              "draws");
   return true;
 }
 

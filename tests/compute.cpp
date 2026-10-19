@@ -348,9 +348,14 @@ int main(int argc, char** argv) {
             pipeline != VK_NULL_HANDLE,
         "vkCreateComputePipelines (SPIR-V translated and compiled)");
 
-  // The M1 boundary, asserted rather than merely documented: a graphics
-  // pipeline must be refused clearly instead of producing something that does
-  // not draw.
+  // The M1 boundary, asserted rather than merely documented: a graphics pipeline
+  // with no state in it at all must be refused clearly instead of producing
+  // something that does not draw.
+  //
+  // M2b made graphics pipelines real, and the draw test is where they are
+  // exercised; what is left to check here is that the entry point did not become
+  // permissive, so a create info with no shader stages, no vertex input, no
+  // rasterization state and no render pass is asked for and must be rejected.
   auto create_graphics_pipelines =
       device_proc<PFN_vkCreateGraphicsPipelines>(device, "vkCreateGraphicsPipelines");
   if (create_graphics_pipelines != nullptr) {
@@ -359,8 +364,8 @@ int main(int argc, char** argv) {
     VkPipeline rejected = VK_NULL_HANDLE;
     const VkResult result = create_graphics_pipelines(device, VK_NULL_HANDLE, 1, &graphics,
                                                       nullptr, &rejected);
-    check(result == VK_ERROR_FEATURE_NOT_PRESENT && rejected == VK_NULL_HANDLE,
-          "graphics pipelines are refused, not silently ignored");
+    check(result == VK_ERROR_INITIALIZATION_FAILED && rejected == VK_NULL_HANDLE,
+          "an empty graphics pipeline is refused, not silently ignored");
   }
 
   if (pipeline == VK_NULL_HANDLE) {

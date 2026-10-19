@@ -49,6 +49,12 @@ struct ContextInfo {
   // refused with a message rather than producing something that does not render.
   bool texture_capable = false;
 
+  // Framebuffers, vertex arrays and draws, i.e. everything M2b needs to render
+  // into an image.  Framebuffer objects and vertex array objects are core in
+  // 3.0, but the set also wants glDrawBuffers, so this is the "can Kniz draw"
+  // flag rather than a version test.
+  bool render_capable = false;
+
   // GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT.  Reported to applications as
   // minStorageBufferOffsetAlignment, and checked when a descriptor is bound:
   // Vulkan caps that limit at 256 while GL's own minimum is also 256, so if the
@@ -146,6 +152,48 @@ struct Functions {
   void (*ClearTexImage)(Enum texture, Int level, Enum format, Enum type,
                         const void* data) = nullptr;
   void (*PixelStorei)(Enum pname, Int param) = nullptr;
+
+  // ---- M2b: framebuffers, vertex arrays and draws -------------------------
+  //
+  // A Vulkan render pass and framebuffer become a GL framebuffer object whose
+  // attachments are the images' own textures; a Vulkan pipeline's vertex input
+  // becomes attribute pointers captured in a vertex array object.  Neither has a
+  // host-side representation, so both are rebuilt when the recorded command stream
+  // is replayed.
+  void (*GenFramebuffers)(Size n, Uint* framebuffers) = nullptr;
+  void (*DeleteFramebuffers)(Size n, const Uint* framebuffers) = nullptr;
+  void (*BindFramebuffer)(Enum target, Uint framebuffer) = nullptr;
+  void (*FramebufferTexture2D)(Enum target, Enum attachment, Enum textarget,
+                               Uint texture, Int level) = nullptr;
+  Enum (*CheckFramebufferStatus)(Enum target) = nullptr;
+  void (*DrawBuffers)(Size n, const Enum* bufs) = nullptr;
+  void (*ClearBufferfv)(Enum buffer, Int drawbuffer, const float* value) = nullptr;
+
+  void (*GenVertexArrays)(Size n, Uint* arrays) = nullptr;
+  void (*DeleteVertexArrays)(Size n, const Uint* arrays) = nullptr;
+  void (*BindVertexArray)(Uint array) = nullptr;
+  void (*EnableVertexAttribArray)(Uint index) = nullptr;
+  void (*DisableVertexAttribArray)(Uint index) = nullptr;
+  void (*VertexAttribPointer)(Uint index, Int size, Enum type,
+                              unsigned char normalized, Size stride,
+                              const void* pointer) = nullptr;
+
+  void (*DrawArrays)(Enum mode, Int first, Size count) = nullptr;
+  void (*DrawElements)(Enum mode, Size count, Enum type,
+                       const void* indices) = nullptr;
+  // Vulkan's vkCmdDrawIndexed has a vertexOffset that GL's plain glDrawElements
+  // does not; this is the entry point that does, and it is core in 3.2.
+  void (*DrawElementsBaseVertex)(Enum mode, Size count, Enum type,
+                                 const void* indices, Int base_vertex) = nullptr;
+
+  void (*Viewport)(Int x, Int y, Size width, Size height) = nullptr;
+  void (*Scissor)(Int x, Int y, Size width, Size height) = nullptr;
+  void (*Enable)(Enum cap) = nullptr;
+  void (*Disable)(Enum cap) = nullptr;
+  void (*CullFace)(Enum mode) = nullptr;
+  void (*FrontFace)(Enum mode) = nullptr;
+  void (*ColorMask)(unsigned char red, unsigned char green, unsigned char blue,
+                    unsigned char alpha) = nullptr;
 };
 
 extern Functions f;
@@ -250,5 +298,44 @@ inline constexpr Enum kFloat = 0x1406;
 inline constexpr Enum kHalfFloat = 0x140B;
 inline constexpr Enum kBgra = 0x80E1;
 inline constexpr Enum kUnsignedInt248 = 0x84FA;
+
+// ---- M2b: framebuffers, vertex arrays and drawing -------------------------
+//
+// The GL tokens for rendering.  Same rule as above: transcribed from
+// /usr/include/GL/glcorearb.h, never from memory.
+
+inline constexpr Enum kFramebuffer = 0x8D40;
+inline constexpr Enum kDrawFramebuffer = 0x8CA9;
+inline constexpr Enum kReadFramebuffer = 0x8CA8;
+inline constexpr Enum kColorAttachment0 = 0x8CE0;
+inline constexpr Enum kFramebufferComplete = 0x8CD5;
+inline constexpr Enum kColorBufferBit = 0x00004000;
+inline constexpr Enum kColor = 0x1800;
+
+inline constexpr Enum kVertexArray = 0x8074;
+inline constexpr Enum kElementArrayBuffer = 0x8893;
+
+inline constexpr Enum kPoints = 0x0000;
+inline constexpr Enum kLines = 0x0001;
+inline constexpr Enum kLineStrip = 0x0003;
+inline constexpr Enum kTriangles = 0x0004;
+inline constexpr Enum kTriangleStrip = 0x0005;
+inline constexpr Enum kTriangleFan = 0x0006;
+
+inline constexpr Enum kByte = 0x1400;
+inline constexpr Enum kShort = 0x1402;
+inline constexpr Enum kInt = 0x1404;
+
+inline constexpr Enum kCullFace = 0x0B44;
+inline constexpr Enum kScissorTest = 0x0C11;
+// Dithering has no Vulkan counterpart, and it perturbs a clear value in the
+// least significant bit rather than writing it exactly.
+inline constexpr Enum kDither = 0x0BD0;
+inline constexpr Enum kBack = 0x0405;
+inline constexpr Enum kFront = 0x0404;
+inline constexpr Enum kFrontAndBack = 0x0408;
+inline constexpr Enum kCcw = 0x0901;
+inline constexpr Enum kCw = 0x0900;
+inline constexpr Uint kNone = 0;
 
 }  // namespace kniz::gl

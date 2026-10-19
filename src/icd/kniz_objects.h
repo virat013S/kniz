@@ -50,6 +50,9 @@ inline constexpr uint64_t kFenceMagic = 0x4B4E495A46454E43ull;           // KNIZ
 inline constexpr uint64_t kImageMagic = 0x4B4E495A494D4147ull;           // KNIZIMAG
 inline constexpr uint64_t kImageViewMagic = 0x4B4E495A49565757ull;       // KNIZIVWW
 
+inline constexpr uint64_t kRenderPassMagic = 0x4B4E495A52504C5Aull;     // KNIZRPLZ
+inline constexpr uint64_t kFramebufferMagic = 0x4B4E495A4652414Dull;     // KNIZFRAM
+
 struct Instance;
 struct PhysicalDevice;
 struct Device;
@@ -68,6 +71,8 @@ struct Fence;
 struct PipelineCache;
 struct Image;
 struct ImageView;
+struct RenderPass;
+struct Framebuffer;
 
 // ---------------------------------------------------------------------------
 // Objects
@@ -292,6 +297,30 @@ struct DescriptorPool {
   std::vector<DescriptorSet*> allocated;
 };
 
+// Where one vertex attribute reads from, resolved from a Vulkan
+// VkVertexInputAttributeDescription against the pipeline's format table.  GL
+// takes the type and component count at the attribute pointer, so the
+// translation happens once, at pipeline creation, rather than at every draw.
+struct VertexAttribute {
+  uint32_t location = 0;
+  uint32_t binding = 0;
+  gl::Enum type = 0;   // GL_FLOAT, GL_UNSIGNED_BYTE, ...
+  gl::Int components = 0;
+  bool normalized = false;
+  uint32_t offset = 0;
+};
+
+struct VertexBinding {
+  uint32_t binding = 0;
+  uint32_t stride = 0;
+  VkVertexInputRate input_rate = VK_VERTEX_INPUT_RATE_VERTEX;
+};
+
+struct BoundVertexBuffer {
+  Buffer* buffer = nullptr;
+  uint64_t offset = 0;
+};
+
 struct Pipeline {
   uint64_t magic = kPipelineMagic;
   Device* device = nullptr;
@@ -304,6 +333,33 @@ struct Pipeline {
   // Kept for diagnostics: when a shader fails to compile, this is the GLSL that
   // GL rejected, and reading it is usually faster than reading the SPIR-V.
   std::string glsl;
+
+  // ---- graphics pipelines (M2b) -------------------------------------------
+  //
+  // A graphics pipeline is a GL program plus a great deal of state that GL keeps
+  // in no single object.  The state is stored here and applied at replay, which
+  // is the only place it can be applied, since GL has no pipeline object.
+  RenderPass* render_pass = nullptr;
+
+  // The vertex array object the attributes are captured in.  One per pipeline,
+  // re-pointed at each draw because the buffers a draw names are only known then.
+  gl::Uint vao = 0;
+
+  std::vector<VertexBinding> vertex_bindings;
+  std::vector<VertexAttribute> vertex_attributes;
+
+  gl::Enum draw_mode = 0;  // GL_TRIANGLES, GL_LINE_STRIP, ...
+
+  bool dynamic_viewport = false;
+  bool dynamic_scissor = false;
+  VkViewport viewport{};
+  VkRect2D scissor{};
+
+  // GL_CULL_FACE is enabled when there is something to cull; kNone means the
+  // pipeline asked for no culling and the capability is turned off.
+  gl::Enum cull_face = gl::kNone;
+  gl::Enum front_face = gl::kCcw;
+  VkColorComponentFlags color_write = 0xF;
 };
 
 // ---------------------------------------------------------------------------
@@ -334,6 +390,13 @@ struct RecordedCommand {
     ClearColorImage,
     CopyBufferToImage,
     CopyImageToBuffer,
+
+    // M2b.  A render pass instance brackets the draws that belong to it, and a
+    // draw captures everything it needs -- resources and state alike -- because
+    // Vulkan says the state a draw uses is the state bound when it is recorded.
+    BeginRenderPass,
+    EndRenderPass,
+    Draw,
   };
 
   Kind kind = Kind::Dispatch;
@@ -368,6 +431,30 @@ struct RecordedCommand {
   // vkCmdCopyBufferToImage / vkCmdCopyImageToBuffer.  The buffer is `dst` for the
   // first kind and `src` for the second, following the direction of the copy.
   std::vector<VkBufferImageCopy> regions;
+
+  // ---- M2b: rendering ------------------------------------------------------
+  //
+  // BeginRenderPass.  The clear values are copied out of the caller's array
+  // because Vulkan lets it be freed as soon as the call returns.
+  Framebuffer* framebuffer = nullptr;
+  VkRect2D render_area{};
+  std::vector<uint8_t> clear_values;
+
+  // Draw.  `pipeline` and `sets` are reused from the dispatch case; the rest is
+  // the state a draw resolves: the vertex buffers bound at the time, the index
+  // buffer if any, and the counts.
+  std::vector<BoundVertexBuffer> vertex_buffers;  // indexed by binding number
+  Buffer* index_buffer = nullptr;
+  uint64_t index_offset = 0;
+  VkIndexType index_type = VK_INDEX_TYPE_UINT16;
+  uint32_t first_vertex = 0;
+  uint32_t vertex_count = 0;
+  uint32_t first_index = 0;
+  uint32_t index_count = 0;
+  int32_t vertex_offset = 0;
+  VkViewport viewport{};
+  VkRect2D scissor{};
+  bool indexed = false;
 };
 
 struct CommandPool {
@@ -390,11 +477,45 @@ struct CommandBuffer {
 
   std::vector<RecordedCommand> commands;
 
-  // Recording-time state.  vkCmdDispatch captures it, so that binding and
-  // dispatching stay independent of replay order.
-  Pipeline* bound_pipeline = nullptr;
-  PipelineLayout* bound_layout = nullptr;
-  std::vector<DescriptorSet*> bound_sets;
+  // Recording-time binding state.  vkCmdDispatch and vkCmdDraw capture it, so
+  // that binding and recording stay independent of replay order.
+  //
+  // Compute and graphics have separate binding points in Vulkan -- a pipeline and
+  // its descriptor sets bound for one are not bound for the other -- so the two
+  // are tracked separately rather than sharing one slot.
+  struct BindState {
+    Pipeline* pipeline = nullptr;
+    PipelineLayout* layout = nullptr;
+    std::vector<DescriptorSet*> sets;
+  };
+
+  BindState compute;
+  BindState graphics;
+
+  // Dynamic state, as recorded by vkCmdSetViewport / vkCmdSetScissor.  A pipeline
+  // that declares a piece of dynamic state ignores its own static copy of it, so
+  // the draw path has to know whether either was ever set.
+  bool viewport_set = false;
+  VkViewport viewport{};
+  bool scissor_set = false;
+  VkRect2D scissor{};
+
+  // Vertex buffers, indexed by Vulkan binding number.  Resized on demand because
+  // a binding index is whatever the pipeline's vertex input declares.
+  std::vector<BoundVertexBuffer> vertex_buffers;
+  Buffer* index_buffer = nullptr;
+  uint64_t index_offset = 0;
+  VkIndexType index_type = VK_INDEX_TYPE_UINT16;
+
+  // The render pass instance the recording is inside, if any.  Vulkan requires a
+  // draw to be recorded inside one, and this is what makes that checkable.
+  //
+  // The render area is kept alongside it because it is not merely a description
+  // of what the load operation clears: Vulkan discards every fragment outside it,
+  // so it acts as a second scissor that the pipeline's own scissor state is
+  // intersected with.
+  Framebuffer* active_framebuffer = nullptr;
+  VkRect2D active_render_area{};
 };
 
 struct Fence {
@@ -464,6 +585,49 @@ struct ImageView {
   VkImageViewType view_type = VK_IMAGE_VIEW_TYPE_2D;
   VkFormat format = VK_FORMAT_UNDEFINED;
   VkImageSubresourceRange range{};
+};
+
+// ---------------------------------------------------------------------------
+// M2b objects: drawing
+// ---------------------------------------------------------------------------
+
+// A render pass describes a set of attachments, how they are loaded and stored,
+// and which of them a subpass writes.  GL has no render pass; the part of this
+// that has a GL representation is the load operation, which becomes a clear of
+// the corresponding framebuffer attachment, and the attachment list itself, which
+// decides which GL attachments the framebuffer has.
+//
+// M2b accepts exactly one subpass.  Subpasses are the one construct GL cannot
+// express at all -- they exist to keep data on-chip between passes, and GL would
+// have to round-trip every one of them through a texture -- so they are refused
+// rather than approximated.  See the fidelity budget in docs/DESIGN.md.
+struct RenderPass {
+  uint64_t magic = kRenderPassMagic;
+  Device* device = nullptr;
+
+  std::vector<VkAttachmentDescription> attachments;
+
+  // The subpass's colour attachments, as attachment indices.  Kept ordered so
+  // that subpass attachment i is GL_COLOR_ATTACHMENTi, which is the mapping
+  // glDrawBuffers and glClearBufferfv both assume.
+  std::vector<uint32_t> color_attachments;
+};
+
+// A framebuffer binds specific image views to a render pass's attachments.  On
+// the GL side it is a framebuffer object, created once, whose attachments are the
+// images' own textures.
+struct Framebuffer {
+  uint64_t magic = kFramebufferMagic;
+  Device* device = nullptr;
+  RenderPass* render_pass = nullptr;
+
+  std::vector<ImageView*> attachments;
+
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint32_t layers = 0;
+
+  gl::Uint gl_framebuffer = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -558,6 +722,14 @@ inline ImageView* from_handle(VkImageView handle) {
   return detail::to_object<ImageView>(kImageViewMagic, handle);
 }
 
+inline RenderPass* from_handle(VkRenderPass handle) {
+  return detail::to_object<RenderPass>(kRenderPassMagic, handle);
+}
+
+inline Framebuffer* from_handle(VkFramebuffer handle) {
+  return detail::to_object<Framebuffer>(kFramebufferMagic, handle);
+}
+
 // The inverse conversions are equally direct.
 inline VkInstance to_handle(Instance* object) {
   return reinterpret_cast<VkInstance>(object);
@@ -613,6 +785,14 @@ inline VkImage to_handle(Image* object) {
 
 inline VkImageView to_handle(ImageView* object) {
   return reinterpret_cast<VkImageView>(object);
+}
+
+inline VkRenderPass to_handle(RenderPass* object) {
+  return reinterpret_cast<VkRenderPass>(object);
+}
+
+inline VkFramebuffer to_handle(Framebuffer* object) {
+  return reinterpret_cast<VkFramebuffer>(object);
 }
 
 inline VkCommandPool to_handle(CommandPool* object) {

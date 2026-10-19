@@ -24,16 +24,28 @@ add_executable(kniz_image image.cpp)
 target_link_libraries(kniz_image PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
 target_compile_options(kniz_image PRIVATE -Wall -Wextra)
 
+# The M2b milestone test: drawing.  It needs four shaders -- a triangle through a
+# vertex buffer and the same triangle asked for its fragments' own coordinates --
+# so the directory holding them is passed as an argument, as with the compute
+# test.
+add_executable(kniz_draw draw.cpp)
+
+target_link_libraries(kniz_draw PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+target_compile_options(kniz_draw PRIVATE -Wall -Wextra)
+
 if(KNIZ_WERROR)
   target_compile_options(kniz_lifecycle PRIVATE -Werror)
   target_compile_options(kniz_compute PRIVATE -Werror)
   target_compile_options(kniz_image PRIVATE -Werror)
+  target_compile_options(kniz_draw PRIVATE -Werror)
 endif()
 
 add_test(NAME lifecycle COMMAND kniz_lifecycle)
 add_test(NAME compute
   COMMAND kniz_compute "${CMAKE_CURRENT_SOURCE_DIR}/shaders/scale.comp.spv")
 add_test(NAME image COMMAND kniz_image)
+add_test(NAME draw
+  COMMAND kniz_draw "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
 
 # The loader resolves the manifest's library_path relative to the manifest's own
 # directory, so build/src is where both the library and its manifest live:
@@ -53,3 +65,4 @@ set(kniz_test_environment
 set_tests_properties(lifecycle PROPERTIES ENVIRONMENT "${kniz_test_environment}")
 set_tests_properties(compute PROPERTIES ENVIRONMENT "${kniz_test_environment}")
 set_tests_properties(image PROPERTIES ENVIRONMENT "${kniz_test_environment}")
+set_tests_properties(draw PROPERTIES ENVIRONMENT "${kniz_test_environment}")

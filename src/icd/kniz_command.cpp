@@ -21,6 +21,7 @@
 #include "kniz_image.h"
 #include "kniz_memory.h"
 #include "kniz_objects.h"
+#include "kniz_render.h"
 
 #include <algorithm>
 #include <cstring>
@@ -233,15 +234,80 @@ void replay(const CommandBuffer& cmd) {
       case RecordedCommand::Kind::CopyImageToBuffer:
         replay_copy_image_to_buffer(command);
         break;
+      case RecordedCommand::Kind::BeginRenderPass:
+        render_begin_pass(command);
+        break;
+      case RecordedCommand::Kind::EndRenderPass:
+        render_end_pass(command);
+        break;
+      case RecordedCommand::Kind::Draw:
+        render_draw(command);
+        break;
     }
   }
 }
 
 void clear_recording_state(CommandBuffer* cmd) {
   cmd->commands.clear();
-  cmd->bound_pipeline = nullptr;
-  cmd->bound_layout = nullptr;
-  cmd->bound_sets.clear();
+
+  cmd->compute = CommandBuffer::BindState{};
+  cmd->graphics = CommandBuffer::BindState{};
+
+  cmd->viewport_set = false;
+  cmd->viewport = VkViewport{};
+  cmd->scissor_set = false;
+  cmd->scissor = VkRect2D{};
+
+  cmd->vertex_buffers.clear();
+  cmd->index_buffer = nullptr;
+  cmd->index_offset = 0;
+  cmd->index_type = VK_INDEX_TYPE_UINT16;
+
+  cmd->active_framebuffer = nullptr;
+  cmd->active_render_area = VkRect2D{};
+}
+
+// The intersection of two rectangles, which is what a Vulkan scissor and a render
+// area amount to together.  An empty result is legal and means nothing draws.
+VkRect2D intersect(const VkRect2D& a, const VkRect2D& b) {
+  const int32_t left = std::max(a.offset.x, b.offset.x);
+  const int32_t top = std::max(a.offset.y, b.offset.y);
+  const int32_t right =
+      std::min(a.offset.x + static_cast<int32_t>(a.extent.width),
+               b.offset.x + static_cast<int32_t>(b.extent.width));
+  const int32_t bottom =
+      std::min(a.offset.y + static_cast<int32_t>(a.extent.height),
+               b.offset.y + static_cast<int32_t>(b.extent.height));
+
+  VkRect2D result{};
+  result.offset = {left, top};
+  result.extent.width = right > left ? static_cast<uint32_t>(right - left) : 0u;
+  result.extent.height = bottom > top ? static_cast<uint32_t>(bottom - top) : 0u;
+  return result;
+}
+
+// Capture the descriptor sets a dispatch or a draw uses.  Vulkan says the
+// descriptors a command uses are the ones bound when it is *recorded*, so they
+// are resolved here and stored in the recorded command rather than looked up at
+// replay.
+bool resolve_descriptor_sets(const CommandBuffer::BindState& state,
+                             Pipeline* pipeline,
+                             std::vector<DescriptorSet*>* out) {
+  PipelineLayout* layout = pipeline->layout;
+  out->assign(layout->sets.size(), nullptr);
+
+  for (size_t set = 0; set < out->size() && set < state.sets.size(); ++set) {
+    DescriptorSet* bound = state.sets[set];
+    if (bound != nullptr && bound->layout != layout->sets[set]) {
+      KNIZ_ERR("descriptor set %zu was created from a different layout than the "
+               "pipeline layout declares for that set; refusing to record the "
+               "command",
+               set);
+      return false;
+    }
+    (*out)[set] = bound;
+  }
+  return true;
 }
 
 }  // namespace
@@ -454,9 +520,18 @@ VKAPI_ATTR void VKAPI_CALL CmdBindPipeline(VkCommandBuffer commandBuffer,
   if (!recording(cmd, "vkCmdBindPipeline"))
     return;
 
-  if (pipelineBindPoint != VK_PIPELINE_BIND_POINT_COMPUTE) {
-    KNIZ_ERR("vkCmdBindPipeline only supports compute bind points until M2");
-    return;
+  CommandBuffer::BindState* state = nullptr;
+  switch (pipelineBindPoint) {
+    case VK_PIPELINE_BIND_POINT_COMPUTE:
+      state = &cmd->compute;
+      break;
+    case VK_PIPELINE_BIND_POINT_GRAPHICS:
+      state = &cmd->graphics;
+      break;
+    default:
+      KNIZ_ERR("bind point %d is not implemented; only compute and graphics are",
+               static_cast<int>(pipelineBindPoint));
+      return;
   }
 
   Pipeline* pipeline = from_handle(pipelineHandle);
@@ -464,9 +539,17 @@ VKAPI_ATTR void VKAPI_CALL CmdBindPipeline(VkCommandBuffer commandBuffer,
     KNIZ_ERR("the pipeline is not a Kniz pipeline");
     return;
   }
+  if (pipeline->bind_point != pipelineBindPoint) {
+    KNIZ_ERR("a %s pipeline was bound at the %s bind point",
+             pipeline->bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS ? "graphics"
+                                                                     : "compute",
+             pipelineBindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS ? "graphics"
+                                                                  : "compute");
+    return;
+  }
 
-  cmd->bound_pipeline = pipeline;
-  cmd->bound_layout = pipeline->layout;
+  state->pipeline = pipeline;
+  state->layout = pipeline->layout;
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdBindDescriptorSets(
@@ -479,9 +562,18 @@ VKAPI_ATTR void VKAPI_CALL CmdBindDescriptorSets(
   if (!recording(cmd, "vkCmdBindDescriptorSets"))
     return;
 
-  if (pipelineBindPoint != VK_PIPELINE_BIND_POINT_COMPUTE) {
-    KNIZ_ERR("vkCmdBindDescriptorSets only supports compute bind points until M2");
-    return;
+  CommandBuffer::BindState* state = nullptr;
+  switch (pipelineBindPoint) {
+    case VK_PIPELINE_BIND_POINT_COMPUTE:
+      state = &cmd->compute;
+      break;
+    case VK_PIPELINE_BIND_POINT_GRAPHICS:
+      state = &cmd->graphics;
+      break;
+    default:
+      KNIZ_ERR("bind point %d is not implemented; only compute and graphics are",
+               static_cast<int>(pipelineBindPoint));
+      return;
   }
 
   if (dynamicOffsetCount > 0) {
@@ -494,14 +586,14 @@ VKAPI_ATTR void VKAPI_CALL CmdBindDescriptorSets(
     KNIZ_ERR("the pipeline layout is not a Kniz pipeline layout");
     return;
   }
-  if (cmd->bound_layout != nullptr && cmd->bound_layout != layout) {
+  if (state->layout != nullptr && state->layout != layout) {
     KNIZ_ERR("vkCmdBindDescriptorSets was given a layout that differs from the "
              "bound pipeline's; the sets would not match the shader");
     return;
   }
 
-  if (firstSet + descriptorSetCount > cmd->bound_sets.size())
-    cmd->bound_sets.resize(firstSet + descriptorSetCount, nullptr);
+  if (firstSet + descriptorSetCount > state->sets.size())
+    state->sets.resize(firstSet + descriptorSetCount, nullptr);
 
   for (uint32_t i = 0; i < descriptorSetCount; ++i) {
     DescriptorSet* set = from_handle(pDescriptorSets[i]);
@@ -509,7 +601,7 @@ VKAPI_ATTR void VKAPI_CALL CmdBindDescriptorSets(
       KNIZ_ERR("descriptor set %u is not a Kniz descriptor set", firstSet + i);
       continue;
     }
-    cmd->bound_sets[firstSet + i] = set;
+    state->sets[firstSet + i] = set;
   }
 }
 
@@ -571,37 +663,361 @@ VKAPI_ATTR void VKAPI_CALL CmdDispatch(VkCommandBuffer commandBuffer,
   if (!recording(cmd, "vkCmdDispatch"))
     return;
 
-  if (cmd->bound_pipeline == nullptr) {
+  if (cmd->compute.pipeline == nullptr) {
     KNIZ_ERR("vkCmdDispatch with no compute pipeline bound");
+    return;
+  }
+
+  Pipeline* pipeline = cmd->compute.pipeline;
+  if (pipeline->bind_point != VK_PIPELINE_BIND_POINT_COMPUTE) {
+    KNIZ_ERR("vkCmdDispatch was given a pipeline built for another bind point");
     return;
   }
 
   RecordedCommand command;
   command.kind = RecordedCommand::Kind::Dispatch;
-  command.pipeline = cmd->bound_pipeline;
+  command.pipeline = pipeline;
   command.group_count[0] = groupCountX;
   command.group_count[1] = groupCountY;
   command.group_count[2] = groupCountZ;
 
-  // Resolve the sets now rather than at replay: Vulkan says the descriptors a
-  // dispatch uses are the ones bound when it is recorded, and capturing them
-  // here makes the recorded command independent of what happens later.
-  PipelineLayout* layout = cmd->bound_pipeline->layout;
-  command.sets.assign(layout->sets.size(), nullptr);
-  for (size_t set = 0; set < command.sets.size() && set < cmd->bound_sets.size();
-       ++set) {
-    DescriptorSet* bound = cmd->bound_sets[set];
-    if (bound != nullptr && bound->layout != layout->sets[set]) {
-      KNIZ_ERR("descriptor set %zu was created from a different layout than the "
-               "pipeline layout declares for that set; refusing to record the "
-               "dispatch",
-               set);
-      return;
-    }
-    command.sets[set] = bound;
-  }
+  if (!resolve_descriptor_sets(cmd->compute, pipeline, &command.sets))
+    return;
 
   cmd->commands.push_back(std::move(command));
+}
+
+// ---------------------------------------------------------------------------
+// Graphics recording
+// ---------------------------------------------------------------------------
+
+// Everything vkCmdDraw and vkCmdDrawIndexed have in common.  A draw captures the
+// pipeline, its descriptor sets, the vertex buffers and the resolved viewport and
+// scissor, because Vulkan defines each of those as the state in force when the
+// draw is *recorded* -- not when it is submitted.
+bool prepare_draw(CommandBuffer* cmd, const char* name, RecordedCommand* out) {
+  if (cmd->active_framebuffer == nullptr) {
+    KNIZ_ERR("%s outside a render pass; Vulkan allows a draw only inside one, and "
+             "dynamic rendering is not implemented",
+             name);
+    return false;
+  }
+  if (cmd->graphics.pipeline == nullptr) {
+    KNIZ_ERR("%s with no graphics pipeline bound", name);
+    return false;
+  }
+
+  Pipeline* pipeline = cmd->graphics.pipeline;
+  if (pipeline->render_pass != cmd->active_framebuffer->render_pass) {
+    KNIZ_ERR("%s: the bound pipeline was created for a different render pass than "
+             "the one the bound framebuffer belongs to",
+             name);
+    return false;
+  }
+
+  out->kind = RecordedCommand::Kind::Draw;
+  out->pipeline = pipeline;
+  out->vertex_buffers = cmd->vertex_buffers;
+  out->index_buffer = cmd->index_buffer;
+  out->index_offset = cmd->index_offset;
+  out->index_type = cmd->index_type;
+
+  if (pipeline->dynamic_viewport) {
+    if (!cmd->viewport_set) {
+      KNIZ_ERR("%s: the pipeline declares dynamic viewport state, but "
+               "vkCmdSetViewport was never called; Kniz refuses rather than "
+               "drawing with a viewport Vulkan leaves undefined",
+               name);
+      return false;
+    }
+    out->viewport = cmd->viewport;
+  } else {
+    out->viewport = pipeline->viewport;
+  }
+
+  if (pipeline->dynamic_scissor) {
+    if (!cmd->scissor_set) {
+      KNIZ_ERR("%s: the pipeline declares dynamic scissor state, but "
+               "vkCmdSetScissor was never called",
+               name);
+      return false;
+    }
+    out->scissor = intersect(cmd->scissor, cmd->active_render_area);
+  } else {
+    out->scissor = intersect(pipeline->scissor, cmd->active_render_area);
+  }
+
+  return resolve_descriptor_sets(cmd->graphics, pipeline, &out->sets);
+}
+
+VKAPI_ATTR void VKAPI_CALL CmdBeginRenderPass(
+    VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo* pRenderPassBegin,
+    VkSubpassContents contents) {
+  CommandBuffer* cmd = from_handle(commandBuffer);
+  if (!recording(cmd, "vkCmdBeginRenderPass"))
+    return;
+  if (pRenderPassBegin == nullptr) {
+    KNIZ_ERR("vkCmdBeginRenderPass was given no begin info");
+    return;
+  }
+  if (cmd->active_framebuffer != nullptr) {
+    KNIZ_ERR("vkCmdBeginRenderPass inside another render pass; Vulkan forbids "
+             "nesting and Kniz has no way to express it on OpenGL");
+    return;
+  }
+  if (contents != VK_SUBPASS_CONTENTS_INLINE) {
+    KNIZ_ERR("secondary command buffers are not implemented");
+    return;
+  }
+
+  Framebuffer* framebuffer = from_handle(pRenderPassBegin->framebuffer);
+  if (framebuffer == nullptr) {
+    KNIZ_ERR("vkCmdBeginRenderPass was given something that is not a Kniz "
+             "framebuffer");
+    return;
+  }
+  const RenderPass* pass = framebuffer->render_pass;
+
+  // The render area must be inside the framebuffer.  Letting it escape would
+  // hand GL coordinates the attachment does not have.
+  const VkRect2D& area = pRenderPassBegin->renderArea;
+  if (area.offset.x < 0 || area.offset.y < 0 || area.extent.width == 0 ||
+      area.extent.height == 0 ||
+      static_cast<uint32_t>(area.offset.x) + area.extent.width >
+          framebuffer->width ||
+      static_cast<uint32_t>(area.offset.y) + area.extent.height >
+          framebuffer->height) {
+    KNIZ_ERR("the render area (%d,%d %ux%u) is not inside the %ux%u framebuffer",
+             area.offset.x, area.offset.y, area.extent.width, area.extent.height,
+             framebuffer->width, framebuffer->height);
+    return;
+  }
+  if (area.offset.x != 0 || area.offset.y != 0 ||
+      area.extent.width != framebuffer->width ||
+      area.extent.height != framebuffer->height) {
+    KNIZ_DBG("the render area is a strict subset of the framebuffer; it is "
+             "honoured through the viewport and scissor, and the load-op clear is "
+             "confined to it the same way");
+  }
+
+  // How many clear values the render pass actually needs: one past the highest
+  // attachment it clears.
+  uint32_t required = 0;
+  for (size_t i = 0; i < pass->attachments.size(); ++i) {
+    if (pass->attachments[i].loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR)
+      required = static_cast<uint32_t>(i) + 1;
+  }
+  if (pRenderPassBegin->clearValueCount < required) {
+    KNIZ_ERR("vkCmdBeginRenderPass supplied %u clear value(s) but the render pass "
+             "clears up to attachment %u, so %u are needed",
+             pRenderPassBegin->clearValueCount, required - 1, required);
+    return;
+  }
+
+  RecordedCommand command;
+  command.kind = RecordedCommand::Kind::BeginRenderPass;
+  command.framebuffer = framebuffer;
+  command.render_area = area;
+
+  // Copied because Vulkan allows the caller to free pClearValues as soon as the
+  // call returns, and nothing is replayed until submit.
+  const uint32_t copy_count =
+      std::min(pRenderPassBegin->clearValueCount,
+               static_cast<uint32_t>(pass->attachments.size()));
+  command.clear_values.resize(copy_count * sizeof(VkClearValue));
+  if (copy_count > 0 && pRenderPassBegin->pClearValues != nullptr) {
+    std::memcpy(command.clear_values.data(), pRenderPassBegin->pClearValues,
+                copy_count * sizeof(VkClearValue));
+  }
+
+  cmd->active_framebuffer = framebuffer;
+  cmd->active_render_area = area;
+  cmd->commands.push_back(std::move(command));
+}
+
+VKAPI_ATTR void VKAPI_CALL CmdEndRenderPass(VkCommandBuffer commandBuffer) {
+  CommandBuffer* cmd = from_handle(commandBuffer);
+  if (!recording(cmd, "vkCmdEndRenderPass"))
+    return;
+  if (cmd->active_framebuffer == nullptr) {
+    KNIZ_ERR("vkCmdEndRenderPass without a matching vkCmdBeginRenderPass");
+    return;
+  }
+
+  RecordedCommand command;
+  command.kind = RecordedCommand::Kind::EndRenderPass;
+  cmd->commands.push_back(std::move(command));
+  cmd->active_framebuffer = nullptr;
+  cmd->active_render_area = VkRect2D{};
+}
+
+VKAPI_ATTR void VKAPI_CALL CmdNextSubpass(VkCommandBuffer commandBuffer,
+                                          VkSubpassContents contents) {
+  (void)contents;
+  CommandBuffer* cmd = from_handle(commandBuffer);
+  if (!recording(cmd, "vkCmdNextSubpass"))
+    return;
+  KNIZ_ERR("vkCmdNextSubpass is not implemented: a render pass has exactly one "
+           "subpass, because OpenGL cannot keep a subpass's results on chip");
+}
+
+VKAPI_ATTR void VKAPI_CALL CmdBindVertexBuffers(
+    VkCommandBuffer commandBuffer, uint32_t firstBinding, uint32_t bindingCount,
+    const VkBuffer* pBuffers, const VkDeviceSize* pOffsets) {
+  CommandBuffer* cmd = from_handle(commandBuffer);
+  if (!recording(cmd, "vkCmdBindVertexBuffers"))
+    return;
+  if (pBuffers == nullptr || pOffsets == nullptr) {
+    KNIZ_ERR("vkCmdBindVertexBuffers was given no buffers or no offsets");
+    return;
+  }
+
+  if (firstBinding + bindingCount > cmd->vertex_buffers.size())
+    cmd->vertex_buffers.resize(firstBinding + bindingCount);
+
+  for (uint32_t i = 0; i < bindingCount; ++i) {
+    Buffer* buffer = from_handle(pBuffers[i]);
+    if (buffer == nullptr) {
+      // Vulkan permits a null handle here to reserve a binding, and a draw that
+      // never reads it is legal, so this is not an error.
+      cmd->vertex_buffers[firstBinding + i] = BoundVertexBuffer{};
+      continue;
+    }
+    if ((buffer->usage & VK_BUFFER_USAGE_VERTEX_BUFFER_BIT) == 0) {
+      KNIZ_ERR("binding %u is a buffer created without "
+               "VK_BUFFER_USAGE_VERTEX_BUFFER_BIT",
+               firstBinding + i);
+      continue;
+    }
+    cmd->vertex_buffers[firstBinding + i] =
+        BoundVertexBuffer{buffer, static_cast<uint64_t>(pOffsets[i])};
+  }
+}
+
+VKAPI_ATTR void VKAPI_CALL CmdBindIndexBuffer(VkCommandBuffer commandBuffer,
+                                              VkBuffer bufferHandle,
+                                              VkDeviceSize offset,
+                                              VkIndexType indexType) {
+  CommandBuffer* cmd = from_handle(commandBuffer);
+  if (!recording(cmd, "vkCmdBindIndexBuffer"))
+    return;
+
+  Buffer* buffer = from_handle(bufferHandle);
+  if (buffer == nullptr) {
+    KNIZ_ERR("vkCmdBindIndexBuffer was given something that is not a Kniz buffer");
+    return;
+  }
+  if ((buffer->usage & VK_BUFFER_USAGE_INDEX_BUFFER_BIT) == 0) {
+    KNIZ_ERR("the index buffer was created without "
+             "VK_BUFFER_USAGE_INDEX_BUFFER_BIT");
+    return;
+  }
+
+  cmd->index_buffer = buffer;
+  cmd->index_offset = static_cast<uint64_t>(offset);
+  cmd->index_type = indexType;
+}
+
+VKAPI_ATTR void VKAPI_CALL CmdSetViewport(VkCommandBuffer commandBuffer,
+                                          uint32_t firstViewport,
+                                          uint32_t viewportCount,
+                                          const VkViewport* pViewports) {
+  CommandBuffer* cmd = from_handle(commandBuffer);
+  if (!recording(cmd, "vkCmdSetViewport"))
+    return;
+  if (firstViewport != 0 || viewportCount != 1 || pViewports == nullptr) {
+    KNIZ_ERR("exactly one viewport is implemented (first %u, count %u)",
+             firstViewport, viewportCount);
+    return;
+  }
+  cmd->viewport = pViewports[0];
+  cmd->viewport_set = true;
+}
+
+VKAPI_ATTR void VKAPI_CALL CmdSetScissor(VkCommandBuffer commandBuffer,
+                                         uint32_t firstScissor,
+                                         uint32_t scissorCount,
+                                         const VkRect2D* pScissors) {
+  CommandBuffer* cmd = from_handle(commandBuffer);
+  if (!recording(cmd, "vkCmdSetScissor"))
+    return;
+  if (firstScissor != 0 || scissorCount != 1 || pScissors == nullptr) {
+    KNIZ_ERR("exactly one scissor is implemented (first %u, count %u)",
+             firstScissor, scissorCount);
+    return;
+  }
+  cmd->scissor = pScissors[0];
+  cmd->scissor_set = true;
+}
+
+VKAPI_ATTR void VKAPI_CALL CmdDraw(VkCommandBuffer commandBuffer,
+                                   uint32_t vertexCount, uint32_t instanceCount,
+                                   uint32_t firstVertex, uint32_t firstInstance) {
+  CommandBuffer* cmd = from_handle(commandBuffer);
+  if (!recording(cmd, "vkCmdDraw"))
+    return;
+
+  if (instanceCount != 1 || firstInstance != 0) {
+    KNIZ_ERR("instanced drawing is not implemented (%u instance(s) starting at "
+             "%u); it needs glDrawArraysInstanced",
+             instanceCount, firstInstance);
+    return;
+  }
+  if (vertexCount == 0)  // Vulkan defines a zero count as a no-op
+    return;
+
+  RecordedCommand command;
+  if (!prepare_draw(cmd, "vkCmdDraw", &command))
+    return;
+  command.indexed = false;
+  command.first_vertex = firstVertex;
+  command.vertex_count = vertexCount;
+  cmd->commands.push_back(std::move(command));
+}
+
+VKAPI_ATTR void VKAPI_CALL CmdDrawIndexed(
+    VkCommandBuffer commandBuffer, uint32_t indexCount, uint32_t instanceCount,
+    uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance) {
+  CommandBuffer* cmd = from_handle(commandBuffer);
+  if (!recording(cmd, "vkCmdDrawIndexed"))
+    return;
+
+  if (instanceCount != 1 || firstInstance != 0) {
+    KNIZ_ERR("instanced drawing is not implemented (%u instance(s) starting at "
+             "%u); it needs glDrawElementsInstanced",
+             instanceCount, firstInstance);
+    return;
+  }
+  if (indexCount == 0)
+    return;
+
+  RecordedCommand command;
+  if (!prepare_draw(cmd, "vkCmdDrawIndexed", &command))
+    return;
+  command.indexed = true;
+  command.first_index = firstIndex;
+  command.index_count = indexCount;
+  command.vertex_offset = vertexOffset;
+  cmd->commands.push_back(std::move(command));
+}
+
+VKAPI_ATTR void VKAPI_CALL CmdClearAttachments(
+    VkCommandBuffer commandBuffer, uint32_t attachmentCount,
+    const VkClearAttachment* pAttachments, uint32_t rectCount,
+    const VkClearRect* pRects) {
+  (void)attachmentCount;
+  (void)pAttachments;
+  (void)rectCount;
+  (void)pRects;
+  CommandBuffer* cmd = from_handle(commandBuffer);
+  if (!recording(cmd, "vkCmdClearAttachments"))
+    return;
+  // A clear of a rectangle inside a render pass has no single GL equivalent: the
+  // scissor would have to be set and the write mask forced, and restoring the
+  // state afterwards is the part that goes wrong.  Squaring that with the
+  // pipeline's own scissor is worth doing deliberately rather than here.
+  KNIZ_ERR("vkCmdClearAttachments is not implemented; use a render pass load-op "
+           "clear, or vkCmdClearColorImage outside the render pass");
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdFillBuffer(VkCommandBuffer commandBuffer,

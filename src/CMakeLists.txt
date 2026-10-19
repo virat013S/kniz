@@ -8,6 +8,7 @@ add_library(kniz SHARED
   icd/kniz_image.cpp
   icd/kniz_descriptor.cpp
   icd/kniz_pipeline.cpp
+  icd/kniz_render.cpp
   icd/kniz_command.cpp)
 
 target_include_directories(kniz PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/icd")

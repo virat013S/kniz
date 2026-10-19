@@ -109,6 +109,22 @@ const Entry kEntries[] = {
     {"vkCmdCopyBufferToImage", as_entry(CmdCopyBufferToImage)},
     {"vkCmdCopyImageToBuffer", as_entry(CmdCopyImageToBuffer)},
 
+    // Render passes, framebuffers and drawing.
+    {"vkCreateRenderPass", as_entry(CreateRenderPass)},
+    {"vkDestroyRenderPass", as_entry(DestroyRenderPass)},
+    {"vkCreateFramebuffer", as_entry(CreateFramebuffer)},
+    {"vkDestroyFramebuffer", as_entry(DestroyFramebuffer)},
+    {"vkCmdBeginRenderPass", as_entry(CmdBeginRenderPass)},
+    {"vkCmdEndRenderPass", as_entry(CmdEndRenderPass)},
+    {"vkCmdNextSubpass", as_entry(CmdNextSubpass)},
+    {"vkCmdBindVertexBuffers", as_entry(CmdBindVertexBuffers)},
+    {"vkCmdBindIndexBuffer", as_entry(CmdBindIndexBuffer)},
+    {"vkCmdSetViewport", as_entry(CmdSetViewport)},
+    {"vkCmdSetScissor", as_entry(CmdSetScissor)},
+    {"vkCmdDraw", as_entry(CmdDraw)},
+    {"vkCmdDrawIndexed", as_entry(CmdDrawIndexed)},
+    {"vkCmdClearAttachments", as_entry(CmdClearAttachments)},
+
     // Submission and synchronisation.
     {"vkQueueSubmit", as_entry(QueueSubmit)},
     {"vkCreateFence", as_entry(CreateFence)},

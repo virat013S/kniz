@@ -25,12 +25,14 @@ work we can do; anything in the "Lost" column is unfixable.
 |---|---|---|
 | `VkCommandBuffer` recording | *(nothing — GL core cannot record)* | **Emulated** via our own IR, replayed at submit. Costs CPU. |
 | `vkCmd*` ordering | immediate GL calls on replay | OK |
-| Render pass, load/store ops, tiling | FBO + `glClear` / `glInvalidateFramebuffer` | Partial — tiling is hidden by GL; load/store can only be approximated |
+| Render pass, load/store ops, tiling | FBO + `glClearBufferfv` | **Partial** — the load op is honoured and the render area is enforced; the store op is unobservable because GL always stores, and tiling does not exist |
 | Subpasses, input attachments | none | **Lost** — must round-trip through a texture. Bandwidth blowup. |
-| `VkPipeline` (PSO) | GL 4.1 SSO + `glProgramUniform` + state | Good |
+| Render area | the scissor rectangle | Good — intersected with the pipeline's own scissor, so a fragment outside it is discarded the way the specification requires |
+| `VkPipeline` (PSO) | a GL program, a VAO and context state | Good — immutable and shareable as Vulkan requires, but GL state lives in the context, so a pipeline has to be re-applied at every draw |
 | Descriptor sets, `VkDescriptorSetLayout` | flat GL binding points, rebound at draw | Partial |
 | Descriptor indexing / non-uniform indexing | `ARB_bindless_texture` | **Lost** on drivers without bindless (check `iris`) |
 | SPIR-V | GLSL via SPIRV-Cross | **Lossy** — no GLSL form for 8/16-bit types, storage-image formats, some group ops |
+| Clip space depth | `gl_Position.z = 2z - w`, injected by SPIRV-Cross | Good — needed because Vulkan's depth range is `[0, w]` and GL's is `[-w, w]`; see §4, M2b |
 | `VkImage` + `vkMapMemory` | GL texture, no host mirror | **Partial** — every read and write goes through a command; `LINEAR` tiling and mapping an image's allocation are refused outright (see §4, M2a) |
 | `VkImage` layout + barriers | none; implicit | Mostly harmless; emit `glMemoryBarrier` where coherence matters |
 | Fences, binary semaphores, events | `GLSync` / synchronous replay | Approximate |
@@ -39,7 +41,7 @@ work we can do; anything in the "Lost" column is unfixable.
 | Multiple queues, cross-queue sync | one context per thread | **Lost** |
 | Sparse resources, residency | none | **Lost** |
 | Queries, timestamps | `GL_TIME_ELAPSED`, occlusion queries | Good |
-| Geometry/tessellation stages | directly supported | Good |
+| Geometry/tessellation stages | directly supported by GL | Expressible in GL, not implemented in Kniz |
 | `VK_KHR_ray_tracing`, mesh shaders | none | **Lost** |
 
 Report capabilities conservatively. Over-reporting a feature we emulate badly
@@ -195,6 +197,24 @@ SPIR-V → GLSL via **SPIRV-Cross**, then compile with the GL driver and cache b
 diagnosis. Expect to maintain a translation-failure list; those are real bugs
 against real apps.
 
+Translation happens at pipeline creation, because that is the first point where
+the pipeline layout is known (see §4, M1), and the translation options are set
+explicitly rather than left to their defaults:
+
+- `version = 450`, `es = false`, `vulkan_semantics = false` — we emit desktop
+  GLSL, and the GL commands are recorded explicitly rather than left to GL's
+  implicit ordering.
+- `vertex.fixup_clipspace = true`. This rewrites `gl_Position.z` to `2z - w`.
+  Vulkan's clip space runs z from 0 to w and GL's from −w to w, so without the
+  rewrite a vertex at Vulkan's near plane lands halfway through GL's depth range
+  and everything in front of it sorts behind it. M2b has no depth attachment to
+  test it against, but it does have `gl_FragCoord.z`: the M2b test's second
+  vertex shader writes depth 0.25 and the fragment shader writes `gl_FragCoord.z`
+  back out, so 0.25 is observed exactly. Without the rewrite the same vertex
+  would read 0.625, which is 0.25 of the way through GL's `[-w, w]` range.
+- `vertex.flip_vert_y = false`. The one thing that *would* need flipping is the
+  one thing that must not be flipped; the argument is in §4, M2b.
+
 ### 3.7 Memory
 
 `VkDeviceMemory` is a shadow record. Actual GL buffers/textures are allocated
@@ -213,8 +233,9 @@ don't know the shape.
 Late, deliberately. In ICD mode *we* implement `vkCreateXlibSurfaceKHR`, so we
 receive the app's `Display` and `Window`; then `glXCreateWindow` + a GL context
 bound to that surface, and present via `glXSwapBuffers`. Wayland needs the EGL
-path. Deferred until render passes and pipelines are known good, so we're never
-debugging WSI and drawing at the same time.
+path. Deferred until render passes and pipelines were known good, so we were
+never debugging WSI and drawing at the same time — M2b is now done, so this is
+next but one.
 
 ### 3.9 Build portability
 
@@ -249,6 +270,68 @@ deliberately plain:
 - CI builds in Ubuntu, Fedora and Arch containers, which between them exercise
   both dependency paths, and additionally in `-DKNIZ_FETCH_DEPS=OFF` mode.
 
+### 3.10 Rendering
+
+A render pass becomes a framebuffer object, an attachment becomes a texture
+attached to it, and the load operation becomes `glClearBufferfv`. Three details
+are worth recording because they are the ones that were not obvious.
+
+- **The clear is indexed by subpass slot, not by attachment index.**
+  `glClearBufferfv(GL_COLOR, i, ...)` clears colour attachment *i of the currently
+  bound framebuffer*, which is the subpass's `i`th colour attachment. A render
+  pass whose colour attachment 0 is attachment 3 of the render pass clears slot 0
+  but tags attachment 3. Kniz stores the subpass slot with the attachment for
+  exactly this reason.
+- **`vkCmdEndRenderPass` unbinds the framebuffer.** GL declares reading a texture
+  that is attached to the currently bound framebuffer undefined, so a read that
+  followed a pass without unbinding could return the previous pass's contents
+  rather than the texture's. The unbind is followed by
+  `glMemoryBarrier(GL_ALL_BARRIER_BITS)`, which is the same over-broad barrier the
+  command replay already uses between dependent commands.
+- **The render area is a second scissor, not just a description of the clear.**
+  Vulkan discards every fragment outside the render area, and applications use
+  that: a pass over half a framebuffer must leave the other half alone. The
+  pipeline's scissor — its own, or the dynamic one set by `vkCmdSetScissor` — is
+  therefore intersected with the render area at the point the draw is recorded,
+  and the intersection is what ends up in `glScissor`.
+- **The colour write mask is reset before the load operation.** A Vulkan load-op
+  clear is not pipeline state, so a pipeline's write mask cannot restrict it,
+  whereas GL keeps the mask in the context next to every draw. Whether
+  `glClearBufferfv` consults the mask is not something to depend on either way —
+  Gallium carries a capability flag for exactly this ambiguity, because the
+  hardware underneath differs — so the mask is set explicitly at the start of
+  every pass. Dithering is switched off for a related reason: Vulkan has none, and
+  it perturbs a clear value in its least significant bit rather than writing it
+  exactly.
+
+A graphics pipeline is a GL program, a vertex array object, and a record of the
+state to apply. GL keeps that state in the context rather than in the object, so
+the pipeline is re-applied at every draw; the object itself stays immutable and
+shareable, which is what Vulkan promises. The VAO is created per pipeline and
+re-pointed at every draw. `GL_ELEMENT_ARRAY_BUFFER` is deliberately left bound
+when the VAO is set up: unbinding it while the VAO is bound would erase it from
+the VAO, and it is part of the VAO's state.
+
+Vertex formats come from a small table — 32- and 16-bit floats, and 8- and
+16-bit normalised and scaled integers. Integer vertex formats are absent on
+purpose: they need `glVertexAttribIPointer` rather than `glVertexAttribPointer`,
+and half of that distinction implemented silently converts values. `B8G8R8A8`
+is absent for a different reason: GL has no BGRA vertex attribute type at all.
+
+What is refused, each with a message naming the construct: more than one subpass,
+a depth/stencil attachment, an input attachment, a resolve attachment, depth test
+or write, stencil test, blending, logic ops, multisampling, sample shading,
+alpha-to-coverage, polygon modes other than `FILL`, depth clamp, rasterizer
+discard, multiple viewports or scissors, primitive restart, instanced vertex
+input, geometry and tessellation stages, specialization constants, dynamic state
+other than `VIEWPORT` and `SCISSOR`, `VK_CULL_MODE_FRONT_AND_BACK`, integer
+vertex formats, and a `VkPipelineColorBlendStateCreateInfo` whose attachment count
+does not match the subpass's colour attachments. `vkCmdClearAttachments` is
+refused too: clearing a rectangle inside a render pass has no single GL
+equivalent, because the scissor would have to be overridden and restored around
+it, and squaring that with the pipeline's own scissor deserves to be done
+deliberately rather than in passing.
+
 ## 4. Milestones
 
 | | Goal | Proves | Gate |
@@ -256,7 +339,9 @@ deliberately plain:
 | **M0** ✅ | Manifest + `vk_icdGetInstanceProcAddr`; `vulkaninfo` lists our device; headless EGL context created | Loader handshake | `vulkaninfo --summary` shows Kniz |
 | **M1** ✅ | Offscreen compute end-to-end, checked against a CPU reference | SPIR-V→GLSL, memory, descriptors — the whole risky spine | numeric test passes |
 | **M2a** ✅ | Images: creation, memory binding, clear, upload, readback | The first object GL cannot mirror, and the layout asymmetry that comes with it | byte-exact round trip |
-| **M2b** | Offscreen graphics: render pass → FBO, PSO → program, triangle → image | Passes, pipelines, state | image matches reference |
+| **M2b** ✅ | Offscreen graphics: render pass → FBO, pipeline → program, draws → image | Passes, pipelines, state, and the coordinate conventions a silently wrong lowering gets wrong | image matches a CPU rasterisation |
+| **M2c** | Uniform buffers and push constants | The descriptor and binding paths, extended from storage buffers to uniforms | numeric test passes |
+| **M2d** | Samplers and textures | GL's sampler state lives on the texture where Vulkan's lives on a sampler object | numeric test passes |
 | **M3** | GLX/EGL swapchain | WSI | `vkcube` on screen |
 | **M4** | Fences, events, timestamps, queries | Correctness | sample suite runs |
 
@@ -350,16 +435,100 @@ moved only then. Vulkan lets an application keep an allocation mapped across a
 submission and write through the pointer it holds, so submission now re-uploads
 any allocation that is mapped at all, whether or not its version changed.
 
-What M2a does *not* cover, and M2b has to add: uniform buffers, push constants,
-textures and samplers, render passes, framebuffers, graphics pipelines. All of
-them are refused with an explicit error today, at the earliest point the
-application reveals it needs one. M2a's own remaining costs, to be revisited:
-image-only allocations still allocate a full host block that the image does not
-use, a sub-region readback of a mip level costs a temporary of the whole level
-(`glGetTexImage` reads a level, not a rectangle), an sRGB view of a UNORM
-image is refused rather than silently sampled with the transfer function missing,
-and GL's filter and wrap state belongs to a texture while Vulkan's belongs to a
-sampler — a real difference that M2b has to place somewhere.
+What M2a did not cover, and M2b added: render passes, framebuffers and graphics
+pipelines for untextured geometry. Uniform buffers and push constants are M2c,
+and textures and samplers M2d; both are still refused with an explicit error at
+the earliest point the application reveals it needs them. M2a's own remaining
+costs, to be revisited: image-only allocations still allocate a full host block
+that the image does not use, a sub-region readback of a mip level costs a
+temporary of the whole level (`glGetTexImage` reads a level, not a rectangle), an
+sRGB view of a UNORM image is refused rather than silently sampled with the
+transfer function missing, and GL's filter and wrap state belongs to a texture
+while Vulkan's belongs to a sampler — a real difference that M2d has to place
+somewhere.
+
+M2b is done: its test (`tests/draw.cpp`) draws a triangle into an image through a
+render pass, a graphics pipeline and two vertex buffers, and compares the result
+against a barycentric evaluation of the same vertex data performed in the test —
+so the image is checked against a computation rather than against a recording of
+what the driver once produced. It then draws the same triangle five more ways —
+indexed, with binding offsets and a negative base vertex; with back faces culled
+and the winding called counter-clockwise; with the same winding called clockwise,
+which has to remove it; with a dynamic viewport; and into a render area covering
+half the framebuffer — asks the rasteriser where each fragment is through a shader
+that writes `gl_FragCoord` back out, and draws once through a pipeline whose
+colour write mask suppresses two of the four channels.
+
+Five things M2b settled.
+
+- **No y flip is needed for vertices or for the winding order either, and this is
+  now checked rather than argued.** The M2a note above establishes that image row
+  *r* is the same row on both sides. The same coordinate arithmetic settles the
+  rest: GL maps `y_d` to a window coordinate counted up from the attachment's
+  bottom-left and Vulkan to a framebuffer coordinate counted down from its
+  top-left, so *for the same NDC input the two produce the same number*. Nothing
+  about vertex positions, the viewport's `y`, the scissor's `y`, or the winding
+  needs touching. The temptation to flip "because the origins differ" is exactly
+  the bug: a flip would turn an image that is correct under Vulkan's convention
+  into an upside-down one. Cancelling the two origin conventions is what Zink has
+  to do, because it goes the other way and must present GL's convention to
+  Vulkan; Kniz passes it through, so `vertex.flip_vert_y` stays false and
+  `VK_FRONT_FACE_COUNTER_CLOCKWISE` maps straight to `GL_CCW`.
+
+  The test does not take this on faith. The triangle's signed area in framebuffer
+  coordinates is positive, which both specifications call counter-clockwise, so
+  culling back faces with a counter-clockwise front face must reproduce the
+  unculled image exactly, and calling the same winding clockwise must remove the
+  triangle entirely. A winding flipped anywhere in the chain fails one or the
+  other, and a vertex-level flip moves the triangle's apex into the first row,
+  where the per-texel checks cannot miss it.
+
+- **The clip space fixup is applied, and it turned out to be observable after all.**
+  SPIRV-Cross rewrites `gl_Position.z` to `2z - w` because Vulkan's depth range is
+  `[0, w]` and GL's is `[-w, w]`. The expectation when M2b started was that nothing
+  in this milestone could tell whether the rewrite had happened, because M2b
+  refuses depth attachments — and that expectation was wrong: `gl_FragCoord.z` is
+  the fragment's depth in GL's window space whether or not a depth buffer exists,
+  so a vertex shader writing Vulkan depth 0.25 has to come back as 0.25, and would
+  come back as 0.625 without the rewrite. The test's second shader pair now asks
+  exactly that, which is the M1 rule applied in the other direction: a detail
+  transcribed from the specification *and then* pinned down by a test, rather than
+  a detail rediscovered later as a bug.
+
+- **A pipeline is not an object to GL, so it is a program plus a list of state to
+  re-apply.** GL's pipeline state — culling, front face, colour mask, viewport,
+  scissor — lives in the context. Two pipelines used in the same pass therefore
+  cannot be "bound" the way Vulkan means it; each draw sets the state it needs.
+  That is the fidelity cost the table in §2 records as "state is per-context, not
+  per-object", and it is paid on every draw rather than at every bind.
+
+- **The render area had to be folded into the scissor, and the test found it.** The
+  first version set the scissor from the render area at `vkCmdBeginRenderPass` and
+  then set it again from the pipeline at each draw, which is correct for the load
+  operation and wrong for everything else: a draw into a half-width render area
+  covered the whole attachment. Vulkan's render area is not a description of what
+  the clear touches, it is a clipping region for the pass. The two are now
+  intersected when the draw is recorded, and a phase that renders into half the
+  framebuffer and requires the other half to keep what was there before is what
+  keeps it that way.
+
+- **A load-op clear is not pipeline state, and GL does not separate the two.** A
+  Vulkan clear happens before any pipeline is in effect; a GL clear sits in the
+  same context state space as every draw, and whether `glClearBufferfv` consults
+  the colour write mask is exactly the kind of thing hardware vendors disagree
+  about. The mask is therefore set explicitly at the start of every pass, and
+  dithering — which Vulkan does not have, and which perturbs a clear value in its
+  least significant bit — is switched off with it. §3.10 has the details; the
+  test's last two phases are the check that a pipeline's mask is applied to its
+  own fragments and the record that the next pass's clear is not affected by it.
+
+M2b's remaining costs, recorded so they do not have to be rediscovered: a VAO and
+a program compile per pipeline, which is more creation-time work than the object
+model strictly needs and will want a cache; there is no state deduplication
+between consecutive draws, so a scene of two thousand objects makes two thousand
+redundant state calls; and the render area intersection means the effective
+scissor is stored per draw, which is cheap but means a dynamic scissor set once
+and used by many draws is recomputed many times.
 
 ## 5. Non-goals
 
