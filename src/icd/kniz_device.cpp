@@ -11,6 +11,7 @@
 // this table references them by name.  Only the table is internal.
 
 #include "kniz_common.h"
+#include "kniz_descriptor.h"
 #include "kniz_device.h"
 #include "kniz_entrypoints.h"
 #include "kniz_objects.h"
@@ -212,6 +213,21 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(
   device->queue.family_index = 0;
   device->queue.queue_index = 0;
 
+  // Push constants have no GL equivalent, so they are lowered onto a uniform
+  // buffer that the device owns and the replay uploads to.  Created here rather
+  // than lazily so that its absence is a device creation failure rather than a
+  // failure halfway through a submission, and so that a command buffer that
+  // writes push constants before any pipeline layout declares ranges still has
+  // somewhere to put them.
+  if (device->instance->gl_ready && device->instance->gl.uniform_capable) {
+    if (!create_push_constant_buffer(device)) {
+      KNIZ_ERR("could not create the push constant buffer");
+      delete device;
+      *pDevice = VK_NULL_HANDLE;
+      return VK_ERROR_INITIALIZATION_FAILED;
+    }
+  }
+
   *pDevice = to_handle(device);
   KNIZ_INFO("device created (queue family 0)");
   KNIZ_TRACE("vkCreateDevice returned handle %p", static_cast<void*>(*pDevice));
@@ -224,6 +240,9 @@ VKAPI_ATTR void VKAPI_CALL DestroyDevice(
   Device* device = from_handle(deviceHandle);
   if (device == nullptr)
     return;
+  // Before the context goes away: the push constant buffer is a GL object and
+  // the instance owns the only context it can be deleted from.
+  destroy_push_constant_buffer(device);
   delete device;
   KNIZ_DBG("device destroyed");
 }

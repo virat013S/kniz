@@ -48,7 +48,7 @@ void fill_limits(VkPhysicalDeviceLimits& l) {
   l.maxTexelBufferElements = 65536;
   l.maxUniformBufferRange = 16384;
   l.maxStorageBufferRange = 134217728;
-  l.maxPushConstantsSize = 128;
+  l.maxPushConstantsSize = kMaxPushConstantsSize;
   l.maxMemoryAllocationCount = 4096;
   l.maxSamplerAllocationCount = 4000;
   l.bufferImageGranularity = 1;

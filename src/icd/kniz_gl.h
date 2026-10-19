@@ -55,11 +55,23 @@ struct ContextInfo {
   // flag rather than a version test.
   bool render_capable = false;
 
+  // Uniform buffer objects.  Core in 3.1, so in practice this is available
+  // whenever anything else Kniz does is: it is checked rather than assumed
+  // because a 3.0 context with buffers and shaders is a configuration the rest
+  // of the driver tolerates.
+  bool uniform_capable = false;
+
   // GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT.  Reported to applications as
   // minStorageBufferOffsetAlignment, and checked when a descriptor is bound:
   // Vulkan caps that limit at 256 while GL's own minimum is also 256, so if the
   // driver wants more, some otherwise legal offsets cannot be represented.
   int ssbo_offset_alignment = 0;
+
+  // GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT, the same problem in the uniform
+  // namespace.  Vulkan's own maximum for minUniformBufferOffsetAlignment is also
+  // 256, and this driver reports 256, so no legal offset is refused here unless
+  // a GL driver wanted more than the specification permits.
+  int ubo_offset_alignment = 0;
 };
 
 // Create a headless GL context and make it current on the calling thread.

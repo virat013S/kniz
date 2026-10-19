@@ -18,6 +18,7 @@
 // docs/DESIGN.md (ADR-1).
 
 #include "kniz_common.h"
+#include "kniz_descriptor.h"
 #include "kniz_image.h"
 #include "kniz_memory.h"
 #include "kniz_objects.h"
@@ -63,67 +64,15 @@ void replay_dispatch(const RecordedCommand& command) {
   gl::report_errors("after glUseProgram");
 
   // The pipeline layout decided, at creation, which GL binding point each
-  // (set, binding) got; the shader was generated from the same table.  So this
-  // loop only has to read the table and bind what the sets hold.
-  for (const GlBinding& mapping : pipeline->bindings) {
-    if (mapping.set >= command.sets.size()) {
-      KNIZ_ERR("dispatch needs set %u, which the pipeline layout declares, but "
-               "the command buffer bound fewer sets",
-               mapping.set);
-      continue;
-    }
-
-    DescriptorSet* set = command.sets[mapping.set];
-    if (set == nullptr) {
-      KNIZ_ERR("dispatch reads set %u binding %u, but no descriptor set is "
-               "bound there",
-               mapping.set, mapping.binding);
-      continue;
-    }
-
-    if (mapping.binding >= set->bindings.size()) {
-      KNIZ_ERR("the bound set has no binding %u", mapping.binding);
-      continue;
-    }
-
-    const DescriptorBinding& binding = set->bindings[mapping.binding];
-    if (!binding.bound || binding.buffer == nullptr) {
-      KNIZ_ERR("set %u binding %u is never written; the dispatch would read "
-               "undefined data",
-               mapping.set, mapping.binding);
-      continue;
-    }
-
-    Buffer* buffer = binding.buffer;
-    uint64_t range = binding.range;
-    if (range == VK_WHOLE_SIZE || range == 0 || range > buffer->size - binding.offset)
-      range = buffer->size - binding.offset;
-
-    // GL requires indexed storage buffer ranges to start at a multiple of
-    // GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT.  Vulkan caps the equivalent
-    // limit at 256, so on a driver that wants more this is the point where the
-    // two cannot be reconciled.
-    const int alignment = static_cast<int>(buffer->device->instance->gl.ssbo_offset_alignment);
-    if (alignment > 0 && binding.offset % static_cast<uint64_t>(alignment) != 0) {
-      KNIZ_ERR("buffer offset %llu is not a multiple of this driver's shader "
-               "storage buffer alignment (%d); the descriptor cannot be bound",
-               static_cast<unsigned long long>(binding.offset), alignment);
-      continue;
-    }
-
-    KNIZ_TRACE("dispatch: set %u binding %u -> GL_SHADER_STORAGE_BUFFER[%u] = "
-               "buffer %u, offset %llu, range %llu",
-               mapping.set, mapping.binding, mapping.gl_index, buffer->gl_name,
-               static_cast<unsigned long long>(binding.offset),
-               static_cast<unsigned long long>(range));
-
-    gl::f.BindBufferRange(gl::kShaderStorageBuffer, mapping.gl_index,
-                          buffer->gl_name,
-                          static_cast<gl::IntPtr>(binding.offset),
-                          gl::as_size_ptr(range));
+  // (set, binding) got; the shader was generated from the same table, and
+  // binding_descriptor_sets reads the same table for the draw path.
+  if (!bind_descriptor_sets(pipeline, command.sets, "dispatch")) {
+    // Binding something wrong and running anyway would compute from data the
+    // application did not ask for, so the dispatch does not happen: the output
+    // keeps its previous contents, which is a failure the application can see.
+    KNIZ_ERR("the dispatch was skipped because its descriptors could not be bound");
+    return;
   }
-
-  gl::report_errors("after binding descriptor sets");
 
   gl::f.DispatchCompute(command.group_count[0], command.group_count[1],
                         command.group_count[2]);
@@ -204,7 +153,21 @@ void replay_copy_image_to_buffer(const RecordedCommand& command) {
   }
 }
 
+void replay_push_constants(const RecordedCommand& command) {
+  apply_push_constants(command.push_layout->device, command.push_layout,
+                       command.push_offset, command.bytes.data(),
+                       static_cast<uint32_t>(command.bytes.size()));
+}
+
 void replay(const CommandBuffer& cmd) {
+  // Push constants are command buffer state that Vulkan leaves undefined at the
+  // start of a recording, and their GL home is a buffer that outlives the
+  // submission.  Clearing it here makes a submission start from a defined state
+  // instead of from whatever the previous submission left behind, which is a
+  // superset of what Vulkan promises and turns an application's own
+  // uninitialised read into zeroes rather than into someone else's data.
+  reset_push_constants(cmd.device);
+
   for (const RecordedCommand& command : cmd.commands) {
     switch (command.kind) {
       case RecordedCommand::Kind::Barrier:
@@ -242,6 +205,9 @@ void replay(const CommandBuffer& cmd) {
         break;
       case RecordedCommand::Kind::Draw:
         render_draw(command);
+        break;
+      case RecordedCommand::Kind::PushConstants:
+        replay_push_constants(command);
         break;
     }
   }
@@ -608,18 +574,55 @@ VKAPI_ATTR void VKAPI_CALL CmdBindDescriptorSets(
 VKAPI_ATTR void VKAPI_CALL CmdPushConstants(
     VkCommandBuffer commandBuffer, VkPipelineLayout layout, VkShaderStageFlags stageFlags,
     uint32_t offset, uint32_t size, const void* pValues) {
-  (void)layout;
+  // The stages are not used here, and that is not an oversight: push constants
+  // are one buffer that every stage of the layout reads, so which stages a write
+  // names cannot change where the bytes go.  Vulkan does validate that the write
+  // lies inside a range declared for those stages, which the layout's own ranges
+  // already imply.
   (void)stageFlags;
-  (void)offset;
-  (void)size;
-  (void)pValues;
   CommandBuffer* cmd = from_handle(commandBuffer);
   if (!recording(cmd, "vkCmdPushConstants"))
     return;
-  // GL has no push constants.  A pipeline whose shader actually reads them is
-  // refused at creation, so if recording reaches here the ranges are declared
-  // but unused and dropping the values changes nothing.
-  KNIZ_DBG("vkCmdPushConstants ignored: OpenGL has no push constant equivalent");
+
+  PipelineLayout* pipeline_layout = from_handle(layout);
+  if (pipeline_layout == nullptr) {
+    KNIZ_ERR("vkCmdPushConstants was given something that is not a Kniz "
+             "pipeline layout");
+    return;
+  }
+  if (pValues == nullptr && size != 0) {
+    KNIZ_ERR("vkCmdPushConstants was given no data for %u byte(s)", size);
+    return;
+  }
+  if (offset % 4 != 0 || size % 4 != 0) {
+    KNIZ_ERR("vkCmdPushConstants covers bytes %u..%u; both the offset and the "
+             "size must be multiples of 4",
+             offset, offset + size);
+    return;
+  }
+  if (offset + size > kMaxPushConstantsSize) {
+    KNIZ_ERR("vkCmdPushConstants covers bytes %u..%u, but this driver reports "
+             "maxPushConstantsSize = %u",
+             offset, offset + size, kMaxPushConstantsSize);
+    return;
+  }
+  if (!pipeline_layout->has_push_constants) {
+    KNIZ_ERR("vkCmdPushConstants writes %u byte(s) at offset %u, but the "
+             "pipeline layout declares no push constant ranges",
+             size, offset);
+    return;
+  }
+
+  // The layout is recorded, not the pipeline: the binding point push constants
+  // live at is a property of the layout, so a values write is valid across the
+  // pipeline binds that may follow it, which is what Vulkan specifies.
+  RecordedCommand command;
+  command.kind = RecordedCommand::Kind::PushConstants;
+  command.push_layout = pipeline_layout;
+  command.push_offset = offset;
+  command.bytes.assign(static_cast<const uint8_t*>(pValues),
+                       static_cast<const uint8_t*>(pValues) + size);
+  cmd->commands.push_back(std::move(command));
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdPipelineBarrier(

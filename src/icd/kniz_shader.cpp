@@ -15,10 +15,17 @@
 namespace kniz {
 namespace {
 
+// Find the GL binding point the pipeline layout gave this (set, binding) pair.
+// The type matters: GL numbers uniform buffers and shader storage buffers in
+// separate namespaces, so the same set and binding can appear twice with
+// different indices, and the wrong one would bind a uniform block's data where
+// the shader reads a storage block.
 bool lookup_gl_index(const std::vector<GlBinding>& bindings, uint32_t set,
-                     uint32_t binding, uint32_t* gl_index) {
+                     uint32_t binding, VkDescriptorType type,
+                     uint32_t* gl_index) {
   for (const GlBinding& candidate : bindings) {
-    if (candidate.set == set && candidate.binding == binding) {
+    if (candidate.set == set && candidate.binding == binding &&
+        candidate.type == type) {
       *gl_index = candidate.gl_index;
       return true;
     }
@@ -31,10 +38,6 @@ bool lookup_gl_index(const std::vector<GlBinding>& bindings, uint32_t set,
 // refusing: the application would get plausible output computed from the wrong
 // data.
 std::string unsupported_feature(const spirv_cross::ShaderResources& resources) {
-  if (!resources.push_constant_buffers.empty())
-    return "push constants";
-  if (!resources.uniform_buffers.empty())
-    return "uniform buffers";
   if (!resources.storage_images.empty())
     return "storage images";
   if (!resources.sampled_images.empty() || !resources.separate_images.empty() ||
@@ -76,12 +79,28 @@ bool execution_model(VkShaderStageFlagBits stage, spv::ExecutionModel* model) {
   }
 }
 
+// Whether the module declares a push constant block at all, asked separately
+// from the translation so that a failure can be attributed: the one translation
+// failure that is peculiar to push constants is a block std140 cannot express,
+// and an unrelated failure should not be described as one.  A malformed module
+// makes this answer no, and the translation below is what reports it.
+bool declares_push_constants(const std::vector<uint32_t>& spirv) {
+  try {
+    spirv_cross::CompilerGLSL compiler(spirv);
+    return !compiler.get_shader_resources().push_constant_buffers.empty();
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
 }  // namespace
 
 ShaderTranslation translate_shader(const std::vector<uint32_t>& spirv,
                                    const std::string& entry_point,
                                    VkShaderStageFlagBits stage,
-                                   const std::vector<GlBinding>& bindings) {
+                                   const std::vector<GlBinding>& bindings,
+                                   uint32_t push_constant_gl_index,
+                                   bool layout_has_push_constants) {
   ShaderTranslation result;
 
   if (spirv.empty()) {
@@ -95,6 +114,8 @@ ShaderTranslation translate_shader(const std::vector<uint32_t>& spirv,
                    " stage is not one of the stages Kniz translates";
     return result;
   }
+
+  const bool has_push_constants = declares_push_constants(spirv);
 
   try {
     spirv_cross::CompilerGLSL compiler(spirv);
@@ -125,6 +146,11 @@ ShaderTranslation translate_shader(const std::vector<uint32_t>& spirv,
     options.vertex.fixup_clipspace = true;
     options.vertex.flip_vert_y = false;
 
+    // GL has no push constants.  SPIRV-Cross can instead emit the push constant
+    // block as a plain uniform block, which is what Kniz binds a buffer to; the
+    // block's binding is rewritten below, like every other resource's.
+    options.emit_push_constant_as_uniform_buffer = true;
+
     compiler.set_common_options(options);
 
     const spirv_cross::ShaderResources resources =
@@ -134,33 +160,69 @@ ShaderTranslation translate_shader(const std::vector<uint32_t>& spirv,
         !missing.empty()) {
       result.error = "the " + std::string(stage_name(stage)) +
                      " shader uses " + missing +
-                     ", which Kniz does not implement yet; only shader storage "
-                     "buffers and vertex attributes are supported so far";
+                     ", which Kniz does not implement yet; only uniform and "
+                     "shader storage buffers, push constants and vertex "
+                     "attributes are supported so far";
       return result;
     }
 
-    // Rewrite every storage buffer onto the GL binding point the pipeline
-    // layout assigned it.
-    for (const spirv_cross::Resource& resource : resources.storage_buffers) {
-      const uint32_t set =
-          compiler.get_decoration(resource.id, spv::DecorationDescriptorSet);
-      const uint32_t binding =
-          compiler.get_decoration(resource.id, spv::DecorationBinding);
+    // A shader that reads push constants needs a layout that declares ranges for
+    // them.  Vulkan says so too, but the failure mode here is worse than a
+    // validation error: Kniz lowers the block onto the reserved uniform binding
+    // point, and a layout with no ranges has a descriptor there instead, so the
+    // shader would read a uniform buffer's first bytes as its push constants and
+    // produce a plausible wrong answer.
+    if (!resources.push_constant_buffers.empty() && !layout_has_push_constants) {
+      result.error =
+          "the " + std::string(stage_name(stage)) + " shader reads push "
+          "constants, but the pipeline layout declares no push constant ranges "
+          "for it; Kniz cannot tell which bytes the shader means";
+      return result;
+    }
 
-      uint32_t gl_index = 0;
-      if (!lookup_gl_index(bindings, set, binding, &gl_index)) {
-        // A resource the pipeline layout does not declare.  Sticking it at
-        // index 0 would bind it over some other resource, so refuse.
-        result.error = "shader declares a storage buffer at set " +
-                       std::to_string(set) + " binding " +
-                       std::to_string(binding) +
-                       ", but the pipeline layout has no such binding";
-        return result;
+    // Rewrite every descriptor onto the GL binding point the pipeline layout
+    // assigned it, and remember which ones this stage actually declared.
+    auto rewrite = [&](const spirv_cross::SmallVector<spirv_cross::Resource>& list,
+                       VkDescriptorType type) -> bool {
+      for (const spirv_cross::Resource& resource : list) {
+        const uint32_t set =
+            compiler.get_decoration(resource.id, spv::DecorationDescriptorSet);
+        const uint32_t binding =
+            compiler.get_decoration(resource.id, spv::DecorationBinding);
+
+        uint32_t gl_index = 0;
+        if (!lookup_gl_index(bindings, set, binding, type, &gl_index)) {
+          // A resource the pipeline layout does not declare.  Sticking it at
+          // index 0 would bind it over some other resource, so refuse.
+          result.error =
+              "shader declares a " +
+              std::string(type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+                              ? "uniform buffer"
+                              : "storage buffer") +
+              " at set " + std::to_string(set) + " binding " +
+              std::to_string(binding) +
+              ", but the pipeline layout has no such binding";
+          return false;
+        }
+
+        compiler.set_decoration(resource.id, spv::DecorationBinding, gl_index);
+        // GLSL has no descriptor sets.  Leaving the decoration in place makes
+        // SPIRV-Cross emit layout(set = N, ...), which will not compile.
+        compiler.set_decoration(resource.id, spv::DecorationDescriptorSet, 0);
+
+        result.used.push_back(GlBinding{set, binding, gl_index, type});
       }
+      return true;
+    };
 
-      compiler.set_decoration(resource.id, spv::DecorationBinding, gl_index);
-      // GLSL has no descriptor sets.  Leaving the decoration in place makes
-      // SPIRV-Cross emit layout(set = N, ...), which will not compile.
+    if (!rewrite(resources.uniform_buffers, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER))
+      return result;
+    if (!rewrite(resources.storage_buffers, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER))
+      return result;
+
+    for (const spirv_cross::Resource& resource : resources.push_constant_buffers) {
+      compiler.set_decoration(resource.id, spv::DecorationBinding,
+                              push_constant_gl_index);
       compiler.set_decoration(resource.id, spv::DecorationDescriptorSet, 0);
     }
 
@@ -173,6 +235,18 @@ ShaderTranslation translate_shader(const std::vector<uint32_t>& spirv,
     result.ok = true;
   } catch (const std::exception& error) {
     result.error = error.what();
+
+    // SPIRV-Cross's own message for a block it cannot express mentions blocks
+    // and layouts, not push constants, so the case that is specific to this
+    // driver is spelled out here.  Only for a shader that has a push constant
+    // block at all: a shader that failed for some unrelated reason should not be
+    // told about push constant packing.
+    if (has_push_constants) {
+      result.error +=
+          " (a push constant block that needs tighter packing than std140 -- an "
+          "array of scalars, for instance -- cannot be expressed as an OpenGL "
+          "uniform block, which is what Kniz lowers push constants onto)";
+    }
   }
 
   return result;

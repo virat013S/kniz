@@ -1,0 +1,32 @@
+#version 450
+
+// M2c refusal test: a push constant block that OpenGL cannot express.
+//
+// Vulkan lays a push constant block out by its own rules, which pack an array of
+// scalars 4 bytes apart.  A GLSL uniform block cannot be packed that tightly --
+// std140 puts those elements 16 bytes apart, and the scalar layout that would
+// match is an extension -- so there is no way to lower this block without the
+// shader reading its members from the wrong offsets.  Kniz refuses the pipeline
+// instead, and the test asserts the refusal rather than the image.
+//
+// This is a real Vulkan construct, not a malformed shader: it is what an
+// application writes when it wants to push four weights.
+//
+// Regenerate with:
+//
+//   glslangValidator -V -o uniform_packed.comp.spv uniform_packed.comp
+
+layout(push_constant) uniform Push {
+    float weights[4];
+} pc;
+
+layout(set = 0, binding = 1, std430) buffer Result {
+    float values[];
+};
+
+layout(local_size_x = 64) in;
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+    values[index] = pc.weights[0] + pc.weights[1] + pc.weights[2] + pc.weights[3];
+}

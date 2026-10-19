@@ -1,0 +1,48 @@
+#version 450
+
+// M2c test: uniform blocks and push constants.
+//
+// Two uniform blocks, in different descriptor sets, with the *same* binding
+// number.  Vulkan allows that and OpenGL does not -- GLSL has one binding
+// namespace per resource class and no sets at all -- so this is the shape that
+// catches a mapping which uses the binding number as the GL binding point.
+//
+// The push constant block holds a scalar followed by a vector, which is the
+// case where Vulkan's push constant layout rules and GLSL's block layout rules
+// are the ones most likely to disagree.
+//
+// Regenerate with:
+//
+//   glslangValidator -V -o uniform.comp.spv uniform.comp
+
+layout(set = 0, binding = 0, std140) uniform FirstBlock {
+    vec4 offset;
+    float scale;
+} first;
+
+layout(set = 1, binding = 0, std140) uniform SecondBlock {
+    vec4 tint;
+} second;
+
+layout(set = 0, binding = 1, std430) buffer Result {
+    float values[];
+};
+
+layout(push_constant) uniform Push {
+    float bias;
+    vec4 multiplier;
+} pc;
+
+layout(local_size_x = 64) in;
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+
+    // Every input reaches the result, and the arithmetic uses no accidental
+    // symmetries: a block bound in the wrong place, a member read at the wrong
+    // offset, or a push constant that never arrived produces a different number
+    // rather than merely a suspicious one.
+    float v = (first.offset.x + first.offset.y + first.offset.z + first.offset.w) * first.scale;
+    float w = second.tint.x + 2.0 * second.tint.y + 3.0 * second.tint.z + 4.0 * second.tint.w;
+    values[index] = (v + w + pc.bias) * pc.multiplier.x + pc.multiplier.y;
+}

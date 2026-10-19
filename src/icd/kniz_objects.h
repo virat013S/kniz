@@ -53,6 +53,13 @@ inline constexpr uint64_t kImageViewMagic = 0x4B4E495A49565757ull;       // KNIZ
 inline constexpr uint64_t kRenderPassMagic = 0x4B4E495A52504C5Aull;     // KNIZRPLZ
 inline constexpr uint64_t kFramebufferMagic = 0x4B4E495A4652414Dull;     // KNIZFRAM
 
+// The largest push constant block Kniz accepts, and what it reports as
+// maxPushConstantsSize.  Vulkan's own minimum for that limit is 128, so a
+// driver cannot advertise less; this is the floor, adopted rather than an
+// arbitrary choice.  GL has no push constants at all, so they are lowered onto
+// a uniform buffer of exactly this size.
+inline constexpr uint32_t kMaxPushConstantsSize = 128;
+
 struct Instance;
 struct PhysicalDevice;
 struct Device;
@@ -165,6 +172,14 @@ struct Device {
   // application's host memory and the GL buffer objects.  See kniz_memory.cpp
   // for why that is necessary and why it is done the blunt way for now.
   std::vector<Buffer*> buffers;
+
+  // The uniform buffer that backs push constants, which GL does not have.  One
+  // is enough for the whole device because replay is synchronous: it is
+  // uploaded to and bound at the reserved binding point as the recorded
+  // vkCmdPushConstants commands replay, so its contents are only ever live
+  // during the replay that wrote them.
+  gl::Uint push_constant_buffer = 0;
+  uint32_t push_constant_capacity = 0;
 };
 
 // True when the device is backed by a live GL context.  Every device entry point
@@ -238,6 +253,32 @@ struct Buffer {
   uint64_t uploaded_version = 0;
 };
 
+// Where one shader resource lives in OpenGL.
+//
+// Vulkan addresses a descriptor by (set, binding); GLSL has one flat binding
+// number per resource class and no notion of sets at all.  Because Kniz
+// generates the GLSL itself, it can rewrite each resource to a dense GL binding
+// point, and this record is the mapping it used -- the pipeline's shader and the
+// replay path both read it, so they cannot disagree.
+struct GlBinding {
+  uint32_t set = 0;
+  uint32_t binding = 0;
+  uint32_t gl_index = 0;
+
+  // Which GL binding namespace the index refers to.  GL keeps uniform buffers
+  // and shader storage buffers in separate spaces that are indexed
+  // independently, so each class is numbered from zero.
+  VkDescriptorType type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+};
+
+// Descriptors of this type are read-only uniform data rather than read-write
+// storage.  Used to decide which namespace a binding belongs in; everything else
+// about the two is the same shape.
+inline bool descriptor_is_uniform(VkDescriptorType type) {
+  return type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+         type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+}
+
 struct DescriptorSetLayoutBinding {
   uint32_t binding = 0;
   VkDescriptorType type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -258,19 +299,33 @@ struct PipelineLayout {
   uint64_t magic = kPipelineLayoutMagic;
   Device* device = nullptr;
   std::vector<DescriptorSetLayout*> sets;
-};
 
-// Where one shader resource lives in OpenGL.
-//
-// Vulkan addresses a descriptor by (set, binding); GLSL has one flat binding
-// number per resource class and no notion of sets at all.  Because Kniz
-// generates the GLSL itself, it can rewrite each resource to a dense GL binding
-// point, and this record is the mapping it used -- the pipeline's shader and
-// the dispatch path both read it, so they cannot disagree.
-struct GlBinding {
-  uint32_t set = 0;
-  uint32_t binding = 0;
-  uint32_t gl_index = 0;
+  // Where every descriptor the layout declares lives in OpenGL, computed once
+  // here because it is a property of the layout alone.
+  //
+  // GLSL has one flat binding namespace per resource class and no descriptor
+  // sets, while Vulkan addresses a descriptor by (set, binding): two resources
+  // in different sets may legally share a binding number.  Compacting rather
+  // than computing set * width + binding is deliberate -- GL bounds these
+  // namespaces by GL_MAX_*_BUFFER_BINDINGS, which can be as low as 8, so the
+  // numbers must stay dense.
+  std::vector<GlBinding> bindings;
+
+  // How many of those are uniform buffers, counting the push constant block if
+  // there is one.  Push constants have no descriptor of their own and are given
+  // the *first* uniform binding point, before the descriptors, because the index
+  // must be the same in every layout an application may legally share a push
+  // with; the reasoning is in kniz_descriptor.cpp.  The replay path and the
+  // generated GLSL read the same number.
+  uint32_t uniform_count = 0;
+  uint32_t push_constant_gl_index = 0;
+
+  // The pipeline layout's push constant ranges, and the end of the last one.
+  // GL has no push constants, so they are lowered onto a uniform buffer that
+  // Kniz owns and uploads to before each draw or dispatch.
+  std::vector<VkPushConstantRange> push_constant_ranges;
+  uint32_t push_constant_size = 0;
+  bool has_push_constants = false;
 };
 
 struct DescriptorBinding {
@@ -328,7 +383,14 @@ struct Pipeline {
   PipelineLayout* layout = nullptr;
 
   gl::Uint program = 0;
-  std::vector<GlBinding> bindings;
+
+  // The descriptors this pipeline's shaders actually read, which is a subset of
+  // what its layout declares: a layout shared between pipelines commonly
+  // declares bindings that a particular pair of stages never touches, and
+  // requiring those to be bound would refuse programs Vulkan accepts.  The
+  // mapping itself lives on the layout, since it is a property of the layout;
+  // this is only the part of it that is used.
+  std::vector<GlBinding> used_bindings;
 
   // Kept for diagnostics: when a shader fails to compile, this is the GLSL that
   // GL rejected, and reading it is usually faster than reading the SPIR-V.
@@ -397,6 +459,13 @@ struct RecordedCommand {
     BeginRenderPass,
     EndRenderPass,
     Draw,
+
+    // M2c.  Push constants are command buffer state, and GL has no equivalent,
+    // so they are recorded in order and uploaded to a uniform buffer as they
+    // replay.  Recording them as their own command rather than folding them
+    // into the draw is what makes the ordering fall out: a draw sees the values
+    // written before it, exactly as Vulkan says.
+    PushConstants,
   };
 
   Kind kind = Kind::Dispatch;
@@ -455,6 +524,16 @@ struct RecordedCommand {
   VkViewport viewport{};
   VkRect2D scissor{};
   bool indexed = false;
+
+  // ---- M2c: push constants ------------------------------------------------
+  //
+  // PushConstants.  The layout names the uniform binding point the values
+  // belong at, which is a property of the layout and therefore stable across
+  // the pipeline binds that may follow it.
+  PipelineLayout* push_layout = nullptr;
+  uint32_t push_offset = 0;
+  // `bytes` holds the payload; the rest of the block keeps whatever the
+  // application last wrote, exactly as Vulkan specifies.
 };
 
 struct CommandPool {

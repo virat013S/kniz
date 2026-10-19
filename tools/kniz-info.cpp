@@ -413,11 +413,15 @@ int main(int argc, char** argv) {
   capability("images: clear, upload, readback", true, "M2a");
   capability("render passes, framebuffers, draws", true, "M2b");
   capability("graphics pipelines and rasterisation", true, "M2b");
+  capability("uniform buffers", true, "M2c");
+  capability("push constants", true, "M2c (lowered onto a uniform buffer)");
   capability("linear tiling (layout is observable)", false, "never planned");
   capability("images: storage, input attachments", false, "not implemented");
   capability("mapping an image's allocation", false, "impossible, see DESIGN.md");
   capability("depth, stencil, blending, multisampling", false, "M2b refused on purpose");
-  capability("uniform buffers, push constants", false, "M2c");
+  capability("dynamic uniform buffers", false, "M2c refused on purpose");
+  capability("push constants: non-std140 packing", false,
+             "OpenGL cannot express it, see DESIGN.md");
   capability("samplers and textures in shaders", false, "M2d");
   capability("swapchain / window presentation", false, "M3");
   capability("fences, queries, timestamps", false, "M4");
@@ -429,13 +433,17 @@ int main(int argc, char** argv) {
       "  offset and a padded buffer row length.  Lines and triangles are drawn into\n"
       "  an image through a render pass, a graphics pipeline and one or two vertex\n"
       "  buffers, and the result is checked against a CPU rasterisation of the same\n"
-      "  geometry rather than merely eyeballed.\n"
+      "  geometry rather than merely eyeballed.  Uniform buffers are read by both\n"
+      "  compute and graphics shaders, including two blocks that share a binding\n"
+      "  number in different sets, and push constants arrive in the shader that\n"
+      "  declared them.\n"
       "\n  Not implemented yet, and refused with a specific error rather than\n"
       "  approximated: depth and stencil, blending, multisampling, instancing,\n"
       "  geometry and tessellation stages, more than one subpass or a depth\n"
-      "  attachment, uniform buffers, push constants, samplers, and presentation.\n"
+      "  attachment, dynamic uniform buffers, samplers, and presentation.\n"
       "  Programs that create a device, ask questions about it, run a compute shader\n"
-      "  over buffers, move image contents, or draw untextured geometry will work.\n"
+      "  over buffers, move image contents, or draw untextured geometry from uniform\n"
+      "  data will work.\n"
       "  See docs/DESIGN.md for what OpenGL cannot express at all.\n"
       "\n  The 'kniz:' lines above are the driver's own log, including the\n"
       "  OpenGL context it created to back this device.\n");

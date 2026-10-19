@@ -33,11 +33,20 @@ add_executable(kniz_draw draw.cpp)
 target_link_libraries(kniz_draw PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
 target_compile_options(kniz_draw PRIVATE -Wall -Wextra)
 
+# The M2c milestone test: uniform buffers and push constants, in both a compute
+# and a graphics pipeline.  It needs its own shaders for the same reason the draw
+# test does, and shares the shaders directory argument with it.
+add_executable(kniz_uniform uniform.cpp)
+
+target_link_libraries(kniz_uniform PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+target_compile_options(kniz_uniform PRIVATE -Wall -Wextra)
+
 if(KNIZ_WERROR)
   target_compile_options(kniz_lifecycle PRIVATE -Werror)
   target_compile_options(kniz_compute PRIVATE -Werror)
   target_compile_options(kniz_image PRIVATE -Werror)
   target_compile_options(kniz_draw PRIVATE -Werror)
+  target_compile_options(kniz_uniform PRIVATE -Werror)
 endif()
 
 add_test(NAME lifecycle COMMAND kniz_lifecycle)
@@ -46,6 +55,8 @@ add_test(NAME compute
 add_test(NAME image COMMAND kniz_image)
 add_test(NAME draw
   COMMAND kniz_draw "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
+add_test(NAME uniform
+  COMMAND kniz_uniform "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
 
 # The loader resolves the manifest's library_path relative to the manifest's own
 # directory, so build/src is where both the library and its manifest live:
@@ -66,3 +77,4 @@ set_tests_properties(lifecycle PROPERTIES ENVIRONMENT "${kniz_test_environment}"
 set_tests_properties(compute PROPERTIES ENVIRONMENT "${kniz_test_environment}")
 set_tests_properties(image PROPERTIES ENVIRONMENT "${kniz_test_environment}")
 set_tests_properties(draw PROPERTIES ENVIRONMENT "${kniz_test_environment}")
+set_tests_properties(uniform PROPERTIES ENVIRONMENT "${kniz_test_environment}")

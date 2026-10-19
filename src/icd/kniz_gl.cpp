@@ -33,6 +33,7 @@ constexpr unsigned int kGlRenderer = 0x1F01;
 constexpr unsigned int kGlVersion = 0x1F02;
 constexpr unsigned int kGlShadingLanguageVersion = 0x8B8C;
 constexpr unsigned int kGlShaderStorageBufferOffsetAlignment = 0x90DF;
+constexpr unsigned int kGlUniformBufferOffsetAlignment = 0x8A34;
 
 // Resolve one entry point.  eglGetProcAddress is the sanctioned route, but a
 // number of stacks return NULL for entry points that are exported directly by
@@ -486,6 +487,13 @@ bool finish_setup() {
       g_info.major > 3 || (g_info.major == 3 && g_info.minor >= 2);
   g_info.render_capable = version_supports_rendering && rendering_ok;
 
+  // Uniform buffer objects became core in 3.1.  They need no entry point that
+  // the buffer set does not already resolve: glBindBufferRange arrived with the
+  // rest of them, because storage buffer objects were modelled on uniform ones.
+  const bool version_supports_uniforms =
+      g_info.major > 3 || (g_info.major == 3 && g_info.minor >= 1);
+  g_info.uniform_capable = version_supports_uniforms && bytes_ok;
+
   if (!bytes_ok) {
     KNIZ_ERR("this OpenGL context is missing buffer or program entry points; "
              "Kniz cannot work with it");
@@ -523,6 +531,23 @@ bool finish_setup() {
     }
   }
 
+  if (g_info.uniform_capable) {
+    gl::Int alignment = 0;
+    f.GetIntegerv(static_cast<Enum>(kGlUniformBufferOffsetAlignment), &alignment);
+    g_info.ubo_offset_alignment = alignment;
+
+    // The same reasoning as above, with the same cap: Kniz reports 256 for
+    // minUniformBufferOffsetAlignment, so a driver wanting more is the one case
+    // where a legal Vulkan offset has no GL equivalent.
+    if (alignment > 256) {
+      KNIZ_WARN(
+          "this driver requires uniform buffer offsets to be a multiple of %d, "
+          "but Vulkan caps minUniformBufferOffsetAlignment at 256; offsets in "
+          "between cannot be expressed and will be refused",
+          alignment);
+    }
+  }
+
   g_info.valid = true;
   g_ok = true;
 
@@ -534,6 +559,13 @@ bool finish_setup() {
     KNIZ_INFO("compute shaders available; shader storage buffer offset "
               "alignment %d",
               g_info.ssbo_offset_alignment);
+  if (g_info.uniform_capable)
+    KNIZ_INFO("uniform buffers available; uniform buffer offset alignment %d",
+              g_info.ubo_offset_alignment);
+  else
+    KNIZ_INFO("uniform buffers are unavailable: they need OpenGL 3.1 and this "
+              "is a %d.%d context",
+              g_info.major, g_info.minor);
   if (g_info.texture_capable)
     KNIZ_INFO("images available: textures, with glTexStorage2D, glClearTexImage "
               "and glGetTexImage");

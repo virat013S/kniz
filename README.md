@@ -37,11 +37,12 @@ The honest, reachable goal:
 
 ## Status
 
-**M2b complete.** Kniz registers as a Vulkan ICD, the loader hands it an instance
+**M2c complete.** Kniz registers as a Vulkan ICD, the loader hands it an instance
 and a device, it brings up a real OpenGL context to back them, and it can run a
-compute shader over storage buffers, move image contents to and from buffers, and
-draw untextured geometry into an image through a render pass and a graphics
-pipeline. It does not present anything to a window yet.
+compute shader over storage buffers and uniform buffers, move image contents to
+and from buffers, and draw untextured geometry into an image through a render pass
+and a graphics pipeline, with uniform buffers and push constants reaching both
+kinds of shader. It does not present anything to a window yet.
 
 Working today:
 
@@ -60,10 +61,17 @@ Working today:
   buffers at once, indexed draws, dynamic viewport and scissor, and back-face
   culling — verified against a CPU rasterisation of the same triangle, including
   which way round the image came out and which winding the triangle has
+- Uniform buffers, in compute and in graphics, including two blocks that share a
+  binding number in different descriptor sets — a shape GLSL cannot express, so it
+  is rewritten onto separate GL binding points and checked by moving the geometry
+  with one block and colouring it with the other
+- Push constants, which OpenGL has no equivalent of, lowered onto a uniform buffer
+  the driver owns and uploaded as the recorded commands replay — verified by
+  running the same pipeline twice with different values and requiring both results
 
-Not implemented: uniform buffers, push constants, samplers, depth and stencil
-attachments, blending, multisampling, instancing, geometry and tessellation
-stages, and presentation. Each is refused with a specific error at the point the
+Not implemented: samplers, depth and stencil attachments, blending,
+multisampling, instancing, geometry and tessellation stages, dynamic uniform
+buffers, and presentation. Each is refused with a specific error at the point the
 application reveals it needs one, rather than accepted and silently ignored. Two
 refusals are permanent rather than pending, and both are argued in
 [`docs/DESIGN.md`](docs/DESIGN.md):
@@ -73,8 +81,7 @@ refusals are permanent rather than pending, and both are argued in
 - Mapping a `VkDeviceMemory` that an image is bound to — an image is a GL
   texture, so the allocation does not hold its pixels.
 
-Next is M2c — uniform buffers and push constants — then M2d for samplers and
-textures, and M3 for a swapchain and a window.
+Next is M2d for samplers and textures, then M3 for a swapchain and a window.
 
 ## Building
 
@@ -144,11 +151,14 @@ What is implemented
   images: clear, upload, readback          yes  M2a
   render passes, framebuffers, draws       yes  M2b
   graphics pipelines and rasterisation     yes  M2b
+  uniform buffers                          yes  M2c
+  push constants                           yes  M2c (lowered onto a uniform buffer)
   linear tiling (layout is observable)     no   never planned
   images: storage, input attachments       no   not implemented
   mapping an image's allocation            no   impossible, see DESIGN.md
   depth, stencil, blending, multisampling  no   M2b refused on purpose
-  uniform buffers, push constants          no   M2c
+  dynamic uniform buffers                  no   M2c refused on purpose
+  push constants: non-std140 packing       no   OpenGL cannot express it, see DESIGN.md
   samplers and textures in shaders         no   M2d
   swapchain / window presentation          no   M3
   fences, queries, timestamps              no   M4
@@ -189,7 +199,7 @@ Set `KNIZ_LOG=0..4` (`error`..`trace`) to control logging; the default is `2`.
 ctest --test-dir build --output-on-failure
 ```
 
-Four tests, all driven through the **real Vulkan loader** rather than by calling
+Five tests, all driven through the **real Vulkan loader** rather than by calling
 the ICD directly. That is deliberate: the most damaging class of ICD bug — a
 dispatchable object that does not reserve its first word for the loader's
 dispatch pointer — is invisible when the ICD is called directly, and produces a
@@ -228,13 +238,29 @@ See the note in [`docs/DESIGN.md`](docs/DESIGN.md).
   back as 0.25 rather than as 0.625. The refusals — a second subpass, a depth
   attachment, an input attachment, blending, a geometry stage, an integer vertex
   format, a pipeline used with another render pass — are asserted too.
+- `uniform` — uniform buffers and push constants (M2c). Two uniform blocks are
+  placed at the *same* binding number in *different* descriptor sets, which Vulkan
+  allows and GLSL cannot express: GL numbers uniform blocks in one flat namespace,
+  so a translation that used the binding number as the GL binding point would leave
+  one buffer answering for both. The compute shader is checked numerically against a
+  CPU computation that no wrong binding reproduces; the graphics shader puts the
+  vertex stage's block in set 0 and the fragment stage's in set 1, so the same
+  mistake moves the geometry to wherever the colour says it should be, and the whole
+  image is compared against the coverage computed on the CPU from the transformed
+  vertices. Push constants are checked by running the same pipeline and layout
+  twice with different values and requiring two different, both correct, results —
+  and by a draw whose descriptor set was never written, which must be refused
+  instead of reading whatever the previous draw left bound. A push constant block
+  that std140 cannot express — Vulkan packs an array of scalars more tightly than a
+  GLSL uniform block can be packed — is asserted to be refused at pipeline
+  creation rather than lowered with its members at the wrong offsets.
 
 The shaders the tests use are checked in twice: as GLSL, and as the compiled
 SPIR-V an application would actually submit. The command that regenerates each
 SPIR-V file is recorded at the top of the GLSL it came from
-(`tests/shaders/scale.comp`, and the four that `draw` uses), and the compiled forms
-are committed so that the test suite does not depend on `glslangValidator` being
-installed.
+(`tests/shaders/scale.comp`, the four that `draw` uses, and the four that
+`uniform` uses), and the compiled forms are committed so that the test suite does
+not depend on `glslangValidator` being installed.
 
 ## Layout
 

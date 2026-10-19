@@ -1,6 +1,7 @@
 #include "kniz_render.h"
 
 #include "kniz_common.h"
+#include "kniz_descriptor.h"
 #include "kniz_image.h"
 #include "kniz_memory.h"
 
@@ -155,6 +156,18 @@ void render_draw(const RecordedCommand& command) {
     return;
 
   gl::f.UseProgram(pipeline->program);
+
+  // ---- descriptors --------------------------------------------------------
+  //
+  // Before the vertex state, because the vertex shader may read a uniform block
+  // and the draw is about to use it.  This is the same call the dispatch path
+  // makes: whether a recorded command is a draw or a dispatch, binding a
+  // descriptor to GL is the same operation, and having one implementation is
+  // what keeps the two from drifting apart.
+  if (!bind_descriptor_sets(pipeline, command.sets, "draw")) {
+    KNIZ_ERR("the draw was skipped because its descriptors could not be bound");
+    return;
+  }
 
   // ---- vertex input -------------------------------------------------------
   //

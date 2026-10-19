@@ -29,7 +29,9 @@ work we can do; anything in the "Lost" column is unfixable.
 | Subpasses, input attachments | none | **Lost** — must round-trip through a texture. Bandwidth blowup. |
 | Render area | the scissor rectangle | Good — intersected with the pipeline's own scissor, so a fragment outside it is discarded the way the specification requires |
 | `VkPipeline` (PSO) | a GL program, a VAO and context state | Good — immutable and shareable as Vulkan requires, but GL state lives in the context, so a pipeline has to be re-applied at every draw |
-| Descriptor sets, `VkDescriptorSetLayout` | flat GL binding points, rebound at draw | Partial |
+| Descriptor sets, `VkDescriptorSetLayout` | flat GL binding points, rebound at draw | Partial — one flat namespace per resource class, and only the bindings the shaders read have to be bound (§3.5) |
+| Uniform buffers | `glBindBufferRange(GL_UNIFORM_BUFFER, …)` | Good — the layout and the shader rewrite share one table, so they cannot disagree |
+| Push constants | a driver-owned uniform buffer, uploaded as the commands replay | **Emulated** — exact for a block std140 can express, refused for one it cannot (§3.11) |
 | Descriptor indexing / non-uniform indexing | `ARB_bindless_texture` | **Lost** on drivers without bindless (check `iris`) |
 | SPIR-V | GLSL via SPIRV-Cross | **Lossy** — no GLSL form for 8/16-bit types, storage-image formats, some group ops |
 | Clip space depth | `gl_Position.z = 2z - w`, injected by SPIRV-Cross | Good — needed because Vulkan's depth range is `[0, w]` and GL's is `[-w, w]`; see §4, M2b |
@@ -180,15 +182,45 @@ current and walks it. Because replay is synchronous:
 ### 3.5 Descriptor sets
 
 Vulkan's set/binding namespace is flattened to GL binding indices, and the whole
-set is re-bound at draw time (GL has no "bind descriptor set"). Use
-`glBindBufferRange(GL_UNIFORM_BUFFER, ...)` / `GL_SHADER_STORAGE_BUFFER`,
-`glBindTextureUnit`, `glBindSampler`.
+set is re-bound at every draw and dispatch (GL has no "bind descriptor set"), with
+`glBindBufferRange` on `GL_UNIFORM_BUFFER` or `GL_SHADER_STORAGE_BUFFER`.
 
-Cache aggressively: rebinding every descriptor on every draw is the classic way
-to lose an order of magnitude of CPU time. Track dirty groups.
+The flattening was M2c's main discovery, and three things about it are worth
+stating because the obvious implementation is wrong:
 
-Bindless (`ARB_bindless_texture`) is the escape hatch for descriptor indexing
-where the driver supports it; needs a feature query and a fallback.
+- **Resources are numbered within their class, not across all of them.** GL keeps
+  one flat namespace per resource class — uniform buffers and shader storage
+  buffers are indexed independently — so a layout whose set 0 has a uniform block
+  at binding 0 and an SSBO at binding 1 must emit GLSL with the block at 0 and the
+  buffer at 0 as well. Numbering uniformly instead still *works*, because the
+  rewrite and the replay agree with each other, but it wastes binding points from
+  a namespace that can be as small as 8.
+- **The layout owns the mapping, because the mapping is a property of the layout.**
+  `PipelineLayout` computes it once and the shader rewrite and the replay both read
+  it, so they cannot drift. Two resources at (set 0, binding 0) and (set 1,
+  binding 0) are both legal in Vulkan and would collide if the binding number were
+  used directly; that shape is what the M2c test is built around, and a driver that
+  got it wrong would answer one shader's reads from the other's buffer.
+- **Only the bindings a pipeline's shaders actually declared have to be bound.**
+  `used_bindings` is the union of what the translated stages reported, not the
+  layout's full list, so a layout shared between pipelines does not force every one
+  of them to write descriptors it never reads. A binding that *is* read and was
+  never written is refused at draw or dispatch time rather than bound from
+  whatever the previous command left behind.
+
+The offsets GL wants are checked against the live driver rather than assumed.
+`GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT` and `GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT`
+are queried at context creation, and a descriptor offset that is not a multiple of
+one is refused with the alignment in the message. Vulkan caps its equivalent
+limits at 256, so a driver asking for more would be a genuine conflict; the
+context reports the value on the log line it prints at startup so that it is
+visible rather than inferred.
+
+Still to do, and still the plan: cache aggressively, since rebinding every
+descriptor on every draw is the classic way to lose an order of magnitude of CPU
+time, and track dirty groups. Bindless (`ARB_bindless_texture`) remains the escape
+hatch for descriptor indexing where the driver supports it; needs a feature query
+and a fallback.
 
 ### 3.6 Shaders
 
@@ -214,6 +246,22 @@ explicitly rather than left to their defaults:
   would read 0.625, which is 0.25 of the way through GL's `[-w, w]` range.
 - `vertex.flip_vert_y = false`. The one thing that *would* need flipping is the
   one thing that must not be flipped; the argument is in §4, M2b.
+- `emit_push_constant_as_uniform_buffer = true`, which is what makes a push
+  constant block expressible at all: GL has no push constants, so the block is
+  emitted as an ordinary `uniform` block and the driver uploads to it (§3.11). The
+  option only changes how the block is *declared*; the binding point it is given is
+  set by Kniz, as with every other resource.
+
+A buffer block is declared in the GLSL with an explicit layout, and `std140` is the
+only one that is always available — `std430` is not permitted for a uniform block,
+and the scalar layout that needs no padding at all is an extension. SPIRV-Cross
+tries the tighter standards and, failing all of them, refuses the block with
+"Buffer block cannot be expressed as any of std430, std140, scalar, even with
+enhanced layouts." That is a real limitation rather than a translation bug — it is
+reachable from legal SPIR-V, for instance a push constant block holding a `float`
+array, where Vulkan's rules put the elements 4 bytes apart and std140 puts them 16
+— so Kniz appends its own sentence to the error saying which construct could not be
+expressed and why, rather than passing the message through unexplained.
 
 ### 3.7 Memory
 
@@ -332,6 +380,73 @@ equivalent, because the scissor would have to be overridden and restored around
 it, and squaring that with the pipeline's own scissor deserves to be done
 deliberately rather than in passing.
 
+### 3.11 Push constants
+
+OpenGL has no push constants in any form, and of everything Kniz emulates this is
+the one with no partial answer available: a wrong binding usually shows up as a
+draw that reads the wrong buffer, whereas a push constant that is dropped produces
+a perfectly plausible image built from stale values.
+
+The design is a uniform buffer that the device owns. `VkPipelineLayout` reserves
+one GL uniform binding point for the block — the *first* one, ahead of every
+descriptor — and the shader's push constant block is rewritten to sit there
+(§3.6). `vkCmdPushConstants` is recorded as its own command in the command IR,
+carrying the bytes and the layout that gives them meaning, and the replay uploads
+them with `glBufferSubData` when it reaches that command. Ordering falls out of the
+recording order, which is what Vulkan specifies: the values a shader sees are the
+last ones written before the command that reads them, and a pipeline bind in
+between does not reset them. That is also why the command records the *layout*
+rather than the pipeline: the binding point is a property of the layout, and a
+values write is valid across the pipeline binds that may follow it.
+
+Numbering the push constants *first* is what makes that last sentence true in
+practice. Vulkan lets an application write push constants with one layout and draw
+with another that is merely "compatible for push constants": the two must have the
+same push constant ranges, and are otherwise unconstrained, so they may declare
+different numbers of uniform buffers. Numbering the descriptors first would make
+the reserved index depend on that count, and a pushed value would land where the
+drawing shader is not looking. Numbering push constants first makes the index
+depend only on whether a layout declares ranges at all, which every compatible
+layout agrees about. The remaining asymmetry — a descriptor bind *between* a push
+and a draw, in a command buffer that mixes a layout with no push constants into a
+sequence that uses one, can overwrite binding point 0 — is recorded among M2c's
+remaining costs in §4 rather than quietly tolerated.
+
+Three further details are decisions rather than consequences:
+
+- **The buffer is bound for its whole length, not for the range that was written.**
+  A block may declare members the application never wrote, and Vulkan says those
+  keep their previous values — which are the ones the buffer already holds.
+  Binding the whole buffer makes the shader read exactly those bytes.
+- **The buffer is zeroed at the start of every submission.** Vulkan leaves push
+  constants undefined at the start of a command buffer, so an application that
+  reads before writing is in undefined territory either way; zeroing turns that
+  into zeroes rather than into the previous submission's data. 128 bytes is a
+  small enough upload to be cheaper than tracking whether the contents are known.
+- **The capacity is 128 bytes**, which is what `maxPushConstantsSize` reports. It
+  is the Vulkan minimum, and the number has one source so the two cannot disagree.
+
+A push constant range is validated where the application declares it: the stage
+flags must name a stage, the size must be non-zero and at most the capacity, the
+offset must be a multiple of 4 because Vulkan requires it, and two ranges for a
+common stage may not overlap. `vkCmdPushConstants` is validated as well, against
+the limit and against a layout that declares no ranges at all — the second of which
+Vulkan also calls invalid usage, and which here would otherwise have the shader
+read a descriptor's bytes as its constants. A *shader* that reads push constants
+against a layout with no ranges is refused at pipeline creation for the same
+reason.
+
+The block's bytes are laid out by Vulkan's rules, which are not GLSL's, so a block
+that cannot be expressed as a `std140` uniform block is refused at pipeline
+creation with the reason appended (§3.6) instead of being emitted with silently
+different offsets. The two layouts agree for the common shape — scalars and
+vectors, and matrices, all get the same offsets and strides under both sets of
+rules — and disagree where a tighter packing is asked for, most visibly for an
+array of scalars, whose elements Vulkan places 4 bytes apart and std140 16. So a
+push constant block of plain vectors, which is what most applications write, is
+expressed exactly; one that needs the tight packing is refused rather than uploaded
+with its members read from the wrong place.
+
 ## 4. Milestones
 
 | | Goal | Proves | Gate |
@@ -340,7 +455,7 @@ deliberately rather than in passing.
 | **M1** ✅ | Offscreen compute end-to-end, checked against a CPU reference | SPIR-V→GLSL, memory, descriptors — the whole risky spine | numeric test passes |
 | **M2a** ✅ | Images: creation, memory binding, clear, upload, readback | The first object GL cannot mirror, and the layout asymmetry that comes with it | byte-exact round trip |
 | **M2b** ✅ | Offscreen graphics: render pass → FBO, pipeline → program, draws → image | Passes, pipelines, state, and the coordinate conventions a silently wrong lowering gets wrong | image matches a CPU rasterisation |
-| **M2c** | Uniform buffers and push constants | The descriptor and binding paths, extended from storage buffers to uniforms | numeric test passes |
+| **M2c** ✅ | Uniform buffers and push constants | The descriptor and binding paths, extended from storage buffers to uniforms, and a construct GL has no equivalent for at all | numeric test passes |
 | **M2d** | Samplers and textures | GL's sampler state lives on the texture where Vulkan's lives on a sampler object | numeric test passes |
 | **M3** | GLX/EGL swapchain | WSI | `vkcube` on screen |
 | **M4** | Fences, events, timestamps, queries | Correctness | sample suite runs |
@@ -361,11 +476,11 @@ fatal:
   is not enough to translate: SPIR-V addresses resources by `(set, binding)`,
   GLSL by one flat binding number, and two sets may legally share a binding
   number. So translation happens at *pipeline* creation, where the layout is
-  known, and the resulting `(set, binding) → GL index` table is stored on the
-  pipeline. The generated GLSL and the dispatch path read the same table, which
-  is what stops them disagreeing. Indices are compacted rather than computed as
-  `set * width + binding`, because `GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS` can be
-  as low as 8.
+  known, and the `(set, binding) → GL index` table is stored on the layout, which
+  the generated GLSL and the replay both read. M1 compacted the indices rather
+  than computing `set * width + binding`, because
+  `GL_MAX_SHADER_STORAGE_BUFFER_BINDINGS` can be as low as 8; M2c refined that to
+  numbering within each resource class, for the reason §3.5 gives.
 - **The emulated `VkDeviceMemory` round trip is sound.** An allocation is host
   memory; buffers copy in and out of it around each submission, keyed off a
   version counter bumped on unmap. The invariant that makes it correct is that
@@ -529,6 +644,54 @@ between consecutive draws, so a scene of two thousand objects makes two thousand
 redundant state calls; and the render area intersection means the effective
 scissor is stored per draw, which is cheap but means a dynamic scissor set once
 and used by many draws is recomputed many times.
+
+M2c is done: its test (`tests/uniform.cpp`) reads uniform buffers from a compute
+shader and from both graphics stages, and checks push constants by running the same
+pipeline twice with different values. It is built around two shapes that a driver
+can get wrong quietly.
+
+- **Two blocks at the same binding number in different sets.** Vulkan allows it;
+  GLSL has no sets at all, so the two must end up at different GL binding points
+  (§3.5). In the compute shader both blocks feed the result through arithmetic with
+  no accidental symmetry, so a collapse shows up as a wrong number rather than a
+  wrong-looking one; in the graphics pipeline the vertex stage takes set 0 and the
+  fragment stage set 1, so a collapse makes the geometry move to wherever the
+  colour says it should be, and the whole 64×64 image is compared against the
+  coverage computed here from the transformed vertices. The check that this test
+  would have caught the bug was made by breaking the translation on purpose: with
+  the raw binding number used as the GL binding point, both the compute and the
+  graphics phases fail.
+
+- **A push constant that arrives late, at the wrong offset, or not at all.** The
+  same pipeline and the same layout run twice with only the push constant changed,
+  and both results have to be right — a value uploaded once per pipeline creation,
+  or uploaded after the draw that reads it, cannot pass both. The block is
+  deliberately a scalar followed by a vector, which is the case where Vulkan's
+  layout rules and std140's could have disagreed and happen to agree; the one that
+  really disagrees, an array of scalars, is refused at pipeline creation (§3.11)
+  and the test asserts that refusal too.
+
+- **A descriptor set whose binding was never written is refused, not drawn.** The
+  test renders with a set that was allocated and never written and requires the
+  image to still be the clear colour. Vulkan calls reading an unwritten descriptor
+  undefined, and the useful answer is to skip the draw: the alternative is a draw
+  computed from the *previous* phase's transform, which is a plausible-looking
+  wrong image rather than an obvious failure.
+
+M2c's remaining costs, recorded here rather than left to be found: descriptors are
+re-bound on every draw and dispatch with no caching or dirty tracking (§3.5); the
+push constant buffer is zeroed once per submission whether or not anything wrote to
+it; dynamic uniform buffers are refused, so an application that wants one buffer
+with many different ranges — the common case for per-object data — is turned away
+rather than served; and push constants are uploaded where the recorded command
+sits, which is correct for every layout an application may legally push with and
+draw with, but which a command buffer that binds a no-push-constant layout's
+descriptors between a push and a draw can still disturb, because the reserved
+binding point is only guaranteed free within one layout rather than across a mixed
+sequence. Making that airtight means snapshotting the values per draw and
+re-uploading when the binding point has been claimed by something else; it is a
+cost paid per draw, and the failure needs an application to deliberately interleave
+two layouts, so it is recorded rather than paid.
 
 ## 5. Non-goals
 
