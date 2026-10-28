@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <string>
 #include <vector>
 
 namespace kniz {
@@ -242,9 +243,15 @@ void dump_presented_frame(int width, int height) {
   gl::f.ReadPixels(0, 0, width, height, gl::kRgba, gl::kUnsignedByte,
                    pixels.data());
 
-  std::FILE* file = std::fopen(path, "wb");
+  // Written beside the destination and renamed into place, because this runs on
+  // every present: a reader that opens the file while a frame is half written
+  // gets a truncated PPM, and the whole point of the dump is that a frame can be
+  // looked at without racing the application.
+  std::string temporary(path);
+  temporary += ".tmp";
+  std::FILE* file = std::fopen(temporary.c_str(), "wb");
   if (file == nullptr) {
-    KNIZ_WARN("could not open %s for KNIZ_PRESENT_DUMP", path);
+    KNIZ_WARN("could not open %s for KNIZ_PRESENT_DUMP", temporary.c_str());
     return;
   }
   std::fprintf(file, "P6\n%d %d\n255\n", width, height);
@@ -254,7 +261,12 @@ void dump_presented_frame(int width, int height) {
     for (int x = 0; x < width; ++x)
       std::fwrite(row + x * 4, 1, 3, file);
   }
-  std::fclose(file);
+  const bool written = std::fclose(file) == 0;
+  if (!written || std::rename(temporary.c_str(), path) != 0) {
+    KNIZ_WARN("could not write the presented frame to %s", path);
+    std::remove(temporary.c_str());
+    return;
+  }
   KNIZ_DBG("presented frame written to %s", path);
 }
 

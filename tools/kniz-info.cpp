@@ -420,10 +420,15 @@ int main(int argc, char** argv) {
   capability("swapchain / window presentation", true,
              "M3 (X11 windows, FIFO)");
   capability("acquire / present / image cycling", true, "M3");
+  capability("depth attachment, depth test/write/compare", true,
+             "M3b (stencil and depth bounds refused)");
+  capability("binary semaphores", true,
+             "M3b (no state: submission and present are synchronous)");
   capability("linear tiling (layout is observable)", false, "never planned");
   capability("images: storage, input attachments", false, "not implemented");
   capability("mapping an image's allocation", false, "impossible, see DESIGN.md");
-  capability("depth, stencil, blending, multisampling", false, "M2b refused on purpose");
+  capability("stencil, depth bounds, blending, multisampling", false,
+             "refused on purpose, see DESIGN.md");
   capability("dynamic uniform buffers", false, "M2c refused on purpose");
   capability("push constants: non-std140 packing", false,
              "OpenGL cannot express it, see DESIGN.md");
@@ -455,16 +460,19 @@ int main(int argc, char** argv) {
       "  than from the image.  A swapchain is created on an X11 window, drawn into\n"
       "  through an ordinary render pass, and presented: the frame that is about to\n"
       "  be shown is read back and compared against the image, so the present path\n"
-      "  is checked rather than looked at.\n"
+      "  is checked rather than looked at.  A D16 depth attachment can be cleared,\n"
+      "  tested with the pipeline's compare operation, written and loaded across a\n"
+      "  pass; vkcube draws and spins through the whole stack.\n"
       "\n  Not implemented yet, and refused with a specific error rather than\n"
-      "  approximated: depth and stencil, blending, multisampling, instancing,\n"
-      "  geometry and tessellation stages, more than one subpass or a depth\n"
-      "  attachment, dynamic uniform buffers, comparison samplers, anisotropic\n"
-      "  filtering, mip levels above 0, Wayland surfaces, and every swapchain\n"
-      "  format but R8G8B8A8_UNORM.\n"
+      "  approximated: the stencil test, the depth bounds test, depth clamping and\n"
+      "  depth bias, blending, multisampling, instancing, geometry and tessellation\n"
+      "  stages, more than one subpass, input attachments, dynamic uniform buffers,\n"
+      "  comparison samplers, anisotropic filtering, mip levels above 0, timeline\n"
+      "  semaphores, Wayland surfaces, and every swapchain format but\n"
+      "  R8G8B8A8_UNORM.\n"
       "  Programs that create a device, ask questions about it, run a compute shader\n"
-      "  over buffers, move image contents, draw geometry textured from uniform and\n"
-      "  sampler data, or draw into a window will work.\n"
+      "  over buffers, move image contents, draw depth-tested geometry textured from\n"
+      "  uniform and sampler data, or draw into a window will work.\n"
       "  See docs/DESIGN.md for what OpenGL cannot express at all.\n"
       "\n  The 'kniz:' lines above are the driver's own log, including the\n"
       "  OpenGL context it created to back this device.\n");

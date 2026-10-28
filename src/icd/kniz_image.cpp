@@ -35,21 +35,31 @@
 namespace kniz {
 namespace {
 
-// | Vulkan format                     | sized internal         | format            | type                 | Bpp | depth |
+// | Vulkan format | sized internal | format | type | Bpp | depth | stencil |
 constexpr ImageFormat kFormats[] = {
-    {VK_FORMAT_R8_UNORM, gl::kR8, gl::kRed, gl::kUnsignedByte, 1, false},
-    {VK_FORMAT_R8G8_UNORM, gl::kRg8, gl::kRg, gl::kUnsignedByte, 2, false},
-    {VK_FORMAT_R8G8B8A8_UNORM, gl::kRgba8, gl::kRgba, gl::kUnsignedByte, 4, false},
-    {VK_FORMAT_R8G8B8A8_SRGB, gl::kSrgb8Alpha8, gl::kRgba, gl::kUnsignedByte, 4, false},
-    {VK_FORMAT_B8G8R8A8_UNORM, gl::kRgba8, gl::kBgra, gl::kUnsignedByte, 4, false},
-    {VK_FORMAT_B8G8R8A8_SRGB, gl::kSrgb8Alpha8, gl::kBgra, gl::kUnsignedByte, 4, false},
-    {VK_FORMAT_R32_SFLOAT, gl::kR32f, gl::kRed, gl::kFloat, 4, false},
-    {VK_FORMAT_R16G16B16A16_SFLOAT, gl::kRgba16f, gl::kRgba, gl::kHalfFloat, 8, false},
-    {VK_FORMAT_R32G32B32A32_SFLOAT, gl::kRgba32f, gl::kRgba, gl::kFloat, 16, false},
-    {VK_FORMAT_D16_UNORM, gl::kDepthComponent16, gl::kDepthComponent, gl::kUnsignedShort, 2, true},
-    {VK_FORMAT_X8_D24_UNORM_PACK32, gl::kDepthComponent24, gl::kDepthComponent, gl::kUnsignedInt, 4, true},
-    {VK_FORMAT_D32_SFLOAT, gl::kDepthComponent32f, gl::kDepthComponent, gl::kFloat, 4, true},
-    {VK_FORMAT_D24_UNORM_S8_UINT, gl::kDepth24Stencil8, gl::kDepthStencil, gl::kUnsignedInt248, 4, true},
+    {VK_FORMAT_R8_UNORM, gl::kR8, gl::kRed, gl::kUnsignedByte, 1, false, false},
+    {VK_FORMAT_R8G8_UNORM, gl::kRg8, gl::kRg, gl::kUnsignedByte, 2, false, false},
+    {VK_FORMAT_R8G8B8A8_UNORM, gl::kRgba8, gl::kRgba, gl::kUnsignedByte, 4, false,
+     false},
+    {VK_FORMAT_R8G8B8A8_SRGB, gl::kSrgb8Alpha8, gl::kRgba, gl::kUnsignedByte, 4,
+     false, false},
+    {VK_FORMAT_B8G8R8A8_UNORM, gl::kRgba8, gl::kBgra, gl::kUnsignedByte, 4, false,
+     false},
+    {VK_FORMAT_B8G8R8A8_SRGB, gl::kSrgb8Alpha8, gl::kBgra, gl::kUnsignedByte, 4,
+     false, false},
+    {VK_FORMAT_R32_SFLOAT, gl::kR32f, gl::kRed, gl::kFloat, 4, false, false},
+    {VK_FORMAT_R16G16B16A16_SFLOAT, gl::kRgba16f, gl::kRgba, gl::kHalfFloat, 8,
+     false, false},
+    {VK_FORMAT_R32G32B32A32_SFLOAT, gl::kRgba32f, gl::kRgba, gl::kFloat, 16, false,
+     false},
+    {VK_FORMAT_D16_UNORM, gl::kDepthComponent16, gl::kDepthComponent,
+     gl::kUnsignedShort, 2, true, false},
+    {VK_FORMAT_X8_D24_UNORM_PACK32, gl::kDepthComponent24, gl::kDepthComponent,
+     gl::kUnsignedInt, 4, true, false},
+    {VK_FORMAT_D32_SFLOAT, gl::kDepthComponent32f, gl::kDepthComponent, gl::kFloat,
+     4, true, false},
+    {VK_FORMAT_D24_UNORM_S8_UINT, gl::kDepth24Stencil8, gl::kDepthStencil,
+     gl::kUnsignedInt248, 4, true, true},
 };
 
 // Image creation flags that would be a lie rather than a simplification live in
@@ -188,6 +198,34 @@ const ImageFormat* image_format(VkFormat format) {
       return &candidate;
   }
   return nullptr;
+}
+
+VkFormatFeatureFlags format_features(VkFormat format) {
+  const ImageFormat* info = image_format(format);
+  if (info == nullptr)
+    return 0;
+
+  // Every format in the table can be moved to and from a buffer, because that is
+  // a byte copy through glGetTexImage/glTexSubImage2D and the table carries the
+  // pixel format for both directions.
+  //
+  // Linear tiling is refused by vkCreateImage -- an image's layout is observable
+  // and GL has none -- so nothing at all is offered there.  An application that
+  // reads this and falls back to optimal tiling gets what it asked for; one that
+  // reads a nonzero linear answer would be told something untrue.
+  //
+  // Blending is not offered because it is not implemented, and neither is
+  // sampling a depth image.  Advertising a feature this driver refuses would be
+  // the same mistake in the other direction.
+  VkFormatFeatureFlags features =
+      VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+  if (info->depth) {
+    features |= VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT;
+  } else {
+    features |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT;
+  }
+  return features;
 }
 
 uint64_t image_byte_size(VkFormat format, const VkExtent3D& extent,
@@ -467,6 +505,28 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateImage(
   const ImageFormat* format = image_format(pCreateInfo->format);
   if (format == nullptr) {
     KNIZ_ERR("image format %d has no OpenGL counterpart",
+             static_cast<int>(pCreateInfo->format));
+    return VK_ERROR_FORMAT_NOT_SUPPORTED;
+  }
+
+  // Usage and format have to agree, and the two ways they can disagree are
+  // different mistakes.  A depth format used as something other than a depth
+  // attachment is asking for a texture this driver cannot sample; a colour format
+  // marked as a depth attachment is asking GL to attach it where it will not go.
+  // Vulkan's own rule covers the second, and the first is Kniz's.
+  if (format->depth) {
+    if ((pCreateInfo->usage & ~kDepthImageUsage) != 0) {
+      KNIZ_ERR("depth format %d was asked for usage 0x%x; a depth image can be a "
+               "depth attachment or be copied, but sampling one is not "
+               "implemented",
+               static_cast<int>(pCreateInfo->format),
+               static_cast<unsigned>(pCreateInfo->usage & ~kDepthImageUsage));
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+  } else if ((pCreateInfo->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) !=
+             0) {
+    KNIZ_ERR("format %d is not a depth format but the image asks for "
+             "VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT",
              static_cast<int>(pCreateInfo->format));
     return VK_ERROR_FORMAT_NOT_SUPPORTED;
   }

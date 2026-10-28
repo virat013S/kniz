@@ -497,14 +497,10 @@ VkResult build_graphics_pipeline(Device* device,
       }
       pipeline->viewport = viewport.pViewports[0];
 
-      // The depth range has no observable effect yet, because a pipeline cannot
-      // have a depth attachment in M2b; the value is kept rather than ignored so
-      // that adding depth later does not have to find it again.
-      if (pipeline->viewport.minDepth != 0.0f || pipeline->viewport.maxDepth != 1.0f) {
-        KNIZ_DBG("viewport depth range [%f, %f] has no effect: this pipeline "
-                 "cannot have a depth attachment",
-                 pipeline->viewport.minDepth, pipeline->viewport.maxDepth);
-      }
+      // The depth range is applied at replay, from the viewport the draw
+      // recorded -- this one here, or the dynamic one if the pipeline declares
+      // dynamic viewport state.  It is not stored separately because Vulkan
+      // defines it as part of the viewport.
     } else if (viewport.pViewports != nullptr) {
       KNIZ_DBG("the pipeline declares dynamic viewport state and also provides "
                "a viewport; the provided one is ignored, as Vulkan says");
@@ -599,19 +595,40 @@ VkResult build_graphics_pipeline(Device* device,
   }
 
   // ---- depth and stencil -------------------------------------------------
-  // Refused only when they would do something.  An application that passes a
-  // depth state with every feature turned off is asking for nothing, and
-  // refusing that would break pipelines that would render exactly as intended.
+  //
+  // Depth test and depth write map onto GL's depth state one for one.  What does
+  // not is the stencil: GL's stencil state is per-face operation triples, and
+  // getting it wrong writes to the stencil buffer silently, so it is refused until
+  // there is a test that checks it.  The depth bounds test is refused for the same
+  // reason -- it is a separate piece of state with no default that matches.
   if (info.pDepthStencilState != nullptr) {
     const VkPipelineDepthStencilStateCreateInfo& depth = *info.pDepthStencilState;
-    if (depth.depthTestEnable || depth.depthWriteEnable || depth.stencilTestEnable) {
-      KNIZ_ERR("depth test, depth write and stencil test are not implemented "
-               "yet; this pipeline asks for %s%s%s",
-               depth.depthTestEnable ? "depth test " : "",
-               depth.depthWriteEnable ? "depth write " : "",
-               depth.stencilTestEnable ? "stencil test" : "");
+
+    if (depth.stencilTestEnable) {
+      KNIZ_ERR("the stencil test is not implemented");
       delete pipeline;
       return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    if (depth.depthBoundsTestEnable) {
+      KNIZ_ERR("the depth bounds test is not implemented");
+      delete pipeline;
+      return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    if (depth.depthTestEnable || depth.depthWriteEnable) {
+      if (depth.depthCompareOp > VK_COMPARE_OP_ALWAYS) {
+        KNIZ_ERR("depth compare operation %d is not one of the eight",
+                 static_cast<int>(depth.depthCompareOp));
+        delete pipeline;
+        return VK_ERROR_INITIALIZATION_FAILED;
+      }
+      // VkCompareOp and GL's comparison functions are the same eight, in the same
+      // order, which is what makes an index into this table enough.
+      constexpr gl::Enum kCompareOps[] = {
+          gl::kNever,  gl::kLess,    gl::kEqual,  gl::kLessOrEqual,
+          gl::kGreater, gl::kNotEqual, gl::kGreaterOrEqual, gl::kAlways};
+      pipeline->depth_test = depth.depthTestEnable != VK_FALSE;
+      pipeline->depth_write = depth.depthWriteEnable != VK_FALSE;
+      pipeline->depth_func = kCompareOps[depth.depthCompareOp];
     }
   }
 

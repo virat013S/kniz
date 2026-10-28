@@ -26,6 +26,9 @@ work we can do; anything in the "Lost" column is unfixable.
 | `VkCommandBuffer` recording | *(nothing — GL core cannot record)* | **Emulated** via our own IR, replayed at submit. Costs CPU. |
 | `vkCmd*` ordering | immediate GL calls on replay | OK |
 | Render pass, load/store ops, tiling | FBO + `glClearBufferfv` | **Partial** — the load op is honoured and the render area is enforced; the store op is unobservable because GL always stores, and tiling does not exist |
+| Depth attachment, depth load op | a depth texture on the FBO, `glClearBufferfv(GL_DEPTH, …)` or `glClearBufferfi` for a packed format | Good for D16 — clear, load and store honoured, and the value a fragment leaves is Vulkan's window depth exactly thanks to the clip space fixup; wider formats and stencil are refused (§3.14) |
+| Depth test, write mask, compare op | `glEnable(GL_DEPTH_TEST)`, `glDepthMask`, `glDepthFunc` | Good, but the no-test case has to be mapped to `GL_ALWAYS`: GL stops updating the depth buffer entirely once the test is disabled, and Vulkan does not (§3.14) |
+| Depth range from `VkViewport` | `glDepthRange` from the recorded viewport | Good — identity mapping, because the fixup makes NDC z carry Vulkan's convention |
 | Subpasses, input attachments | none | **Lost** — must round-trip through a texture. Bandwidth blowup. |
 | Render area | the scissor rectangle | Good — intersected with the pipeline's own scissor, so a fragment outside it is discarded the way the specification requires |
 | `VkPipeline` (PSO) | a GL program, a VAO and context state | Good — immutable and shareable as Vulkan requires, but GL state lives in the context, so a pipeline has to be re-applied at every draw |
@@ -383,18 +386,21 @@ and half of that distinction implemented silently converts values. `B8G8R8A8`
 is absent for a different reason: GL has no BGRA vertex attribute type at all.
 
 What is refused, each with a message naming the construct: more than one subpass,
-a depth/stencil attachment, an input attachment, a resolve attachment, depth test
-or write, stencil test, blending, logic ops, multisampling, sample shading,
-alpha-to-coverage, polygon modes other than `FILL`, depth clamp, rasterizer
-discard, multiple viewports or scissors, primitive restart, instanced vertex
-input, geometry and tessellation stages, specialization constants, dynamic state
-other than `VIEWPORT` and `SCISSOR`, `VK_CULL_MODE_FRONT_AND_BACK`, integer
-vertex formats, and a `VkPipelineColorBlendStateCreateInfo` whose attachment count
-does not match the subpass's colour attachments. `vkCmdClearAttachments` is
-refused too: clearing a rectangle inside a render pass has no single GL
-equivalent, because the scissor would have to be overridden and restored around
-it, and squaring that with the pipeline's own scissor deserves to be done
-deliberately rather than in passing.
+a depth format in a colour attachment slot (and the converse in the depth slot),
+an input attachment, a resolve attachment, stencil test, blending, logic ops,
+multisampling, sample shading, alpha-to-coverage, polygon modes other than `FILL`,
+depth clamp, rasterizer discard, multiple viewports or scissors, primitive
+restart, instanced vertex input, geometry and tessellation stages, specialization
+constants, dynamic state other than `VIEWPORT` and `SCISSOR`,
+`VK_CULL_MODE_FRONT_AND_BACK`, integer vertex formats, and a
+`VkPipelineColorBlendStateCreateInfo` whose attachment count does not match the
+subpass's colour attachments. `vkCmdClearAttachments` is refused too: clearing a
+rectangle inside a render pass has no single GL equivalent, because the scissor
+would have to be overridden and restored around it, and squaring that with the
+pipeline's own scissor deserves to be done deliberately rather than in passing.
+Depth attachments, depth test and depth write left this list when M3b landed;
+what remains refused about depth — stencil, depth bounds, wide depth formats — is
+in §3.14, which is where the depth path is documented.
 
 ### 3.11 Push constants
 
@@ -618,6 +624,67 @@ old swapchain and its replacement; and because the drawable belongs to the
 surface, a destroyed window keeps its drawable until the surface is destroyed,
 which Vulkan requires the application to do anyway.
 
+### 3.14 Depth attachments, the depth test and depth writes
+
+Depth is the first attachment OpenGL and Vulkan describe almost the same way, and
+the first where a disagreement about the *absence* of state rather than the state
+itself turns up. What M3b implements and what it refuses:
+
+- **The render pass takes one depth/stencil attachment.** It may be
+  `VK_ATTACHMENT_UNUSED` while the colour attachments are listed; the format must
+  be one of the depth formats and the image behind the framebuffer must have been
+  created with `VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT`, checked at
+  framebuffer creation. `LOAD`, `CLEAR` and `DON'T_CARE`-becomes-`CLEAR` are all
+  honoured for depth; `stencilLoadOp` is required to match the depth op when the
+  format has a stencil aspect, because GL clears the two aspects of a packed
+  format with a single `glClearBufferfi` and a stencil-only clear would leave one
+  of them wrong.
+- **The clear value comes from the render pass, and is observable.** A pass that
+  clears depth to 0.5 must reject a draw at 0.75 — if the driver cleared to the
+  conventional 1.0 instead of the value the application gave it, the draw lands
+  and the rejection is gone. The depth test pins this with a non-default clear.
+- **The depth test and write state are per-pipeline, re-applied per draw.**
+  `depthCompareOp` maps through an eight-entry table onto `0x0200..0x0207`, which
+  are exactly GL's `NEVER..ALWAYS` in enum order. `glDepthRange` is applied from
+  the draw's recorded `VkViewport` — the mapping there is the identity, because
+  the clip space fixup (§4, M2b) makes NDC z carry Vulkan's `[0, w]` convention,
+  so window depth is the number the application wrote.
+- **A disabled test still writes, which GL will not do for you.** Vulkan's
+  `depthTestEnable = FALSE` with `depthWriteEnable = TRUE` means "never compare,
+  keep writing"; OpenGL stops updating the depth buffer the moment
+  `GL_DEPTH_TEST` is disabled, on the Intel driver and on llvmpipe alike. Kniz
+  maps that case to the test enabled with `GL_ALWAYS` — a comparison that never
+  rejects and a write path that runs — and leaves `glDisable(GL_DEPTH_TEST)` for
+  the one Vulkan state it correctly describes: no test and no writes. The rule is
+  recorded here rather than left in the code because it is the kind of thing the
+  GL specification does not put in the sentence about `glDepthMask`, and the phase
+  of the depth test that catches it is the reason the mapping is right on both
+  the Intel driver and llvmpipe rather than by luck on one.
+- **Still refused:** the stencil test, `depthBoundsTestEnable`, depth clamping
+  and depth bias, and depth formats wider than 16 bits (`D24_UNORM_S8_UINT`
+  excepted from the refusal only until stencil is real). A depth image may be
+  created with attachment, transfer-src and transfer-dst usage and nothing else;
+  sampled depth is a different API (`sampler2DShadow`) gate and is refused until
+  comparison samplers exist.
+
+The format report is the third leg and exists because of vkcube:
+`vkGetPhysicalDeviceFormatProperties` was a stub until M3b, returning zero
+features for every format. vkcube asks it whether `VK_FORMAT_R8G8B8A8_SRGB` can
+be sampled before deciding how to build its texture, takes the linear-tiling
+branch when the answer is no — which Kniz refuses — and never creates the optimal
+image, then presents a null image view three steps later. The report is now
+derived from the same table `vkCreateImage` consults, so the promise and the
+behaviour cannot drift apart, and the depth test checks the mirror question on
+`D16_UNORM` too: reported as attachable, not reported as sampleable, refused to
+be either.
+
+Binary semaphores round the milestone out because vkcube creates them before its
+first submit: as objects they exist — created, destroyed, passed around freely —
+but they carry no state, because every submission and every present
+is synchronous and their only legal observable state window is empty.
+`vkCreateSemaphore` with a timeline type is refused at creation, and a timeline
+semaphore is one of §5's non-goals.
+
 ## 4. Milestones
 
 | | Goal | Proves | Gate |
@@ -629,7 +696,7 @@ which Vulkan requires the application to do anyway.
 | **M2c** ✅ | Uniform buffers and push constants | The descriptor and binding paths, extended from storage buffers to uniforms, and a construct GL has no equivalent for at all | numeric test passes |
 | **M2d** ✅ | Samplers and textures | GL's sampler state lives on the texture where Vulkan's lives on a sampler object | numeric test passes |
 | **M3a** ✅ | Swapchain and presentation on an X11 window | WSI: surfaces, images the driver owns, and the one legitimate flip | presented frame matches the image |
-| **M3b** | Depth and stencil attachments | The pipeline state `vkcube` needs before it will draw | `vkcube` on screen |
+| **M3b** ✅ | Depth testing, depth writes, binary semaphores; `vkcube` runs | The pipeline state `vkcube` needs before it will draw | The nine-phase depth chain, and `vkcube` on screen |
 | **M4** | Fences, events, timestamps, queries | Correctness | sample suite runs |
 
 M0 is done and was checked on the development machine (Intel HD 4400 / Mesa
@@ -972,9 +1039,75 @@ kept anyway, since it is what makes the present independent of whatever sampler
 the application last bound to unit 0 — but this gate does not prove it, and saying
 so is more useful than implying otherwise.
 
-M3a's remaining costs are in §3.13. What it leaves undone is what `vkcube`
-needs next: a depth attachment, depth test and depth write, which M2b refuses, and
-which is why M3b exists as a separate milestone rather than being folded in here.
+M3a's remaining costs are in §3.13.
+
+M3b is done: its test (`tests/depth.cpp`) records nine passes against the same
+colour-plus-depth framebuffer pair, where every phase's outcome depends on the
+buffer the previous phase left behind, and each link is chosen so that one
+specific plausible mistake flips it: a clear to a non-default 0.5 that must
+reject a draw at 0.75 (a 1.0 clear draws instead); a nearer draw that must pass;
+a `loadOp LOAD` pass that must still hold 0.25 (a quietly re-cleared or
+reallocated attachment draws instead); a nearer draw against the loaded value;
+a second clear that must put 0.5 back, checked in the depth readback because the
+colour cannot distinguish "0.5" from "0.1" for a 0.9 draw; a no-test pipeline
+that must still write; the value it wrote seen by the next pass; a
+`VK_COMPARE_OP_GREATER` pipeline accepting the draw `LESS` rejected; and a
+no-write pipeline testing without writing. Every phase checks the entire colour
+attachment and the entire depth attachment — the depth against
+`round(z · 65535)`, which is what a 16-bit unorm conversion produces — rather
+than a sample of either, and both readbacks ride the same submission, so a phase
+cannot pass its colour check at the cost of its depth one or the other way
+round.
+
+The refusals are the usual negative mirror: depth format with sampled or colour
+usage at image creation, colour format with depth usage, a colour format in the
+subpass's depth slot, a colour image in the framebuffer's depth slot, a
+stencil-aspect clear on a packed format, the stencil test and the depth bounds
+test in a pipeline, and a timeline semaphore. Five of them run before a single
+pixel is drawn, which is the point — the application that asks wrong learns it
+before guessing.
+
+Three other things M3b settled:
+
+- **`vkGetPhysicalDeviceFormatProperties` cannot be a stub.** vkcube was the
+  first application to ask it a question, and an M0-era stub — zero features for
+  every format — sent it down a path that ended in a null image view three
+  calls later. The answer now comes from the same table `vkCreateImage` consults
+  (§3.14), and the depth test checks the question vkcube actually asks
+  (`vkGetPhysicalDeviceImageFormatProperties`) agrees with what image creation
+  would have said.
+- **A disabled depth test in GL stops the writes too.** The first M3b build
+  honoured `depthTestEnable = FALSE, depthWriteEnable = TRUE` by disabling the
+  test and leaving the mask on, and the write silently did not happen — on the
+  Intel driver *and* on llvmpipe. GL and Vulkan disagree about what losing the
+  test means, and the Vulkan meaning is the one an application invokes for
+  depth-only pre-passes, so the mapping is now the test enabled with
+  `GL_ALWAYS` (§3.14). The phase that found it is a phase that asks for exactly
+  that shape and demands the readback change.
+- **`vkcube` had a second crash that was all its own.** Even after the format
+  report was fixed, `demo_destroy_texture` frees a buffer's memory before
+  destroying the buffer that is still bound to it — a spec violation in the
+  application, not the driver. Kniz warns and drops the binding rather than
+  freeing memory GL may still hold handles into; vkcube runs to `SIGKILL` after
+  four seconds of spinning cube instead of crashing, and the frame it presents is
+  the lunar cube (verified through `KNIZ_PRESENT_DUMP` once more after M3b: the
+  655×674 frame from M3a, with the depth-tested cube on it).
+
+Binary semaphores are handled without ceremony because there is nothing to
+mirror: `vkQueuePresentKHR` and `vkQueueSubmit` are synchronous in Kniz, so the
+object exists and its state window is empty by construction (§3.14). The
+free-before-destroy warning above is documented rather than punished; vkcube's
+own teardown violates the spec and refusing it would make the canonical smoke
+test refuse to close cleanly, which serves nobody.
+
+M3b's remaining costs, recorded rather than hidden: stencil is the next real
+piece of the depth path and is currently refused at three separate entry points
+(render pass, pipeline, image format); `D24_UNORM_S8_UINT` and friends are in the
+format table but nothing below 16-bit-unorm conversion semantics is written
+through them yet; and a `loadOp LOAD` pass on a framebuffer that has never been
+rendered into reads GL's undefined initial contents, which the test never
+exercises because a framebuffer that has not been rendered to has no honest
+contents to load.
 
 ## 5. Non-goals
 

@@ -265,6 +265,11 @@ struct Functions {
   Enum (*CheckFramebufferStatus)(Enum target) = nullptr;
   void (*DrawBuffers)(Size n, const Enum* bufs) = nullptr;
   void (*ClearBufferfv)(Enum buffer, Int drawbuffer, const float* value) = nullptr;
+  // The depth clear needs a different entry point from the colour one, and a
+  // combined depth/stencil clear needs this one, which takes both values at once
+  // because GL will not clear one aspect of a packed format alone.
+  void (*ClearBufferfi)(Enum buffer, Int drawbuffer, float depth, Int stencil) =
+      nullptr;
 
   void (*GenVertexArrays)(Size n, Uint* arrays) = nullptr;
   void (*DeleteVertexArrays)(Size n, const Uint* arrays) = nullptr;
@@ -291,6 +296,10 @@ struct Functions {
   void (*FrontFace)(Enum mode) = nullptr;
   void (*ColorMask)(unsigned char red, unsigned char green, unsigned char blue,
                     unsigned char alpha) = nullptr;
+  // Depth state, which Vulkan puts in the pipeline and GL keeps in the context.
+  void (*DepthMask)(unsigned char flag) = nullptr;
+  void (*DepthFunc)(Enum func) = nullptr;
+  void (*DepthRange)(double near_value, double far_value) = nullptr;
 
   // ---- M3: presentation ---------------------------------------------------
   //
@@ -432,6 +441,10 @@ inline constexpr Enum kColorAttachment0 = 0x8CE0;
 inline constexpr Enum kFramebufferComplete = 0x8CD5;
 inline constexpr Enum kColorBufferBit = 0x00004000;
 inline constexpr Enum kColor = 0x1800;
+inline constexpr Enum kDepth = 0x1801;
+inline constexpr Enum kDepthAttachment = 0x8D00;
+inline constexpr Enum kDepthStencilAttachment = 0x821A;
+inline constexpr Enum kDepthBufferBit = 0x00000100;
 
 inline constexpr Enum kVertexArray = 0x8074;
 inline constexpr Enum kElementArrayBuffer = 0x8893;
@@ -465,6 +478,18 @@ inline constexpr Enum kDither = 0x0BD0;
 inline constexpr Enum kBack = 0x0405;
 inline constexpr Enum kFront = 0x0404;
 inline constexpr Enum kFrontAndBack = 0x0408;
+// The depth comparison functions, in the order VkCompareOp declares them:
+// NEVER, LESS, EQUAL, LESS_OR_EQUAL, GREATER, NOT_EQUAL, GREATER_OR_EQUAL,
+// ALWAYS.  GL numbers the same eight the same way, one after another, which is
+// why kniz_pipeline.cpp can index a table with a VkCompareOp.
+inline constexpr Enum kNever = 0x0200;
+inline constexpr Enum kLess = 0x0201;
+inline constexpr Enum kEqual = 0x0202;
+inline constexpr Enum kLessOrEqual = 0x0203;
+inline constexpr Enum kGreater = 0x0204;
+inline constexpr Enum kNotEqual = 0x0205;
+inline constexpr Enum kGreaterOrEqual = 0x0206;
+inline constexpr Enum kAlways = 0x0207;
 inline constexpr Enum kCcw = 0x0901;
 inline constexpr Enum kCw = 0x0900;
 inline constexpr Uint kNone = 0;

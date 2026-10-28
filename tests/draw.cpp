@@ -518,17 +518,18 @@ int main(int argc, char** argv) {
               VK_ERROR_FEATURE_NOT_PRESENT,
           "a render pass with two subpasses is refused");
 
-    // A depth attachment implies depth testing, which is refused too, so
-    // accepting the attachment would only move the failure somewhere less
-    // explicable.
+    // A depth *format* in a colour slot is refused: GL would attach it where the
+    // subpass does not draw, and every pixel would come back as whatever the depth
+    // test wrote.  (A depth attachment in the depth slot arrived in M3b, and
+    // tests/depth.cpp is where that lives.)
     VkAttachmentDescription depth_attachment = attachment;
     depth_attachment.format = VK_FORMAT_D16_UNORM;
     info.subpassCount = 1;
     info.pSubpasses = &subpass;
     info.pAttachments = &depth_attachment;
     check(create_render_pass(device, &info, nullptr, &unused) ==
-              VK_ERROR_FEATURE_NOT_PRESENT,
-          "a depth attachment is refused");
+              VK_ERROR_INITIALIZATION_FAILED,
+          "a depth format in a colour attachment is refused");
 
     VkAttachmentReference input{0, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
     VkSubpassDescription with_input = subpass;

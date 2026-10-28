@@ -1407,6 +1407,57 @@ VKAPI_ATTR VkResult VKAPI_CALL ResetFences(VkDevice deviceHandle,
   return VK_SUCCESS;
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL CreateSemaphore(
+    VkDevice deviceHandle, const VkSemaphoreCreateInfo* pCreateInfo,
+    const VkAllocationCallbacks* pAllocator, VkSemaphore* pSemaphore) {
+  (void)pAllocator;
+  if (pSemaphore == nullptr)
+    return VK_ERROR_INITIALIZATION_FAILED;
+  *pSemaphore = VK_NULL_HANDLE;
+
+  Device* device = from_handle(deviceHandle);
+  if (device == nullptr)
+    return VK_ERROR_INITIALIZATION_FAILED;
+  if (pCreateInfo != nullptr && pCreateInfo->flags != 0) {
+    KNIZ_ERR("semaphore creation flags 0x%x are not implemented",
+             static_cast<unsigned>(pCreateInfo->flags));
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+  }
+
+  // A timeline semaphore is a counter with real state, and Kniz would have to
+  // keep and honour it.  Accepting one and treating it as binary would deadlock
+  // the first application that waits on a value.
+  const auto* type = static_cast<const VkSemaphoreTypeCreateInfo*>(
+      pCreateInfo != nullptr ? pCreateInfo->pNext : nullptr);
+  while (type != nullptr) {
+    if (type->sType == VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO) {
+      if (type->semaphoreType != VK_SEMAPHORE_TYPE_BINARY) {
+        KNIZ_ERR("timeline semaphores are not implemented");
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+      }
+      break;
+    }
+    type = static_cast<const VkSemaphoreTypeCreateInfo*>(type->pNext);
+  }
+
+  Semaphore* semaphore = new (std::nothrow) Semaphore();
+  if (semaphore == nullptr)
+    return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+  semaphore->device = device;
+  *pSemaphore = to_handle(semaphore);
+  return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL DestroySemaphore(
+    VkDevice deviceHandle, VkSemaphore semaphoreHandle,
+    const VkAllocationCallbacks* pAllocator) {
+  (void)pAllocator;
+  if (from_handle(deviceHandle) == nullptr)
+    return;
+  delete from_handle(semaphoreHandle);
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL GetFenceStatus(VkDevice deviceHandle,
                                               VkFence fenceHandle) {
   if (from_handle(deviceHandle) == nullptr)

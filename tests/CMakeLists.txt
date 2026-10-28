@@ -56,6 +56,14 @@ add_executable(kniz_present present.cpp)
 target_link_libraries(kniz_present PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
 target_compile_options(kniz_present PRIVATE -Wall -Wextra)
 
+# The M3b milestone test: depth attachments, the depth test and depth writes.  It
+# needs two shaders -- one triangle drawn at whatever depth a push constant names
+# -- so it takes the shaders directory too.
+add_executable(kniz_depth depth.cpp)
+
+target_link_libraries(kniz_depth PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+target_compile_options(kniz_depth PRIVATE -Wall -Wextra)
+
 if(KNIZ_WERROR)
   target_compile_options(kniz_lifecycle PRIVATE -Werror)
   target_compile_options(kniz_compute PRIVATE -Werror)
@@ -64,6 +72,7 @@ if(KNIZ_WERROR)
   target_compile_options(kniz_uniform PRIVATE -Werror)
   target_compile_options(kniz_sampler PRIVATE -Werror)
   target_compile_options(kniz_present PRIVATE -Werror)
+  target_compile_options(kniz_depth PRIVATE -Werror)
 endif()
 
 add_test(NAME lifecycle COMMAND kniz_lifecycle)
@@ -78,6 +87,8 @@ add_test(NAME sampler
   COMMAND kniz_sampler "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
 add_test(NAME present
   COMMAND kniz_present "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
+add_test(NAME depth
+  COMMAND kniz_depth "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
 
 # The loader resolves the manifest's library_path relative to the manifest's own
 # directory, so build/src is where both the library and its manifest live:

@@ -244,6 +244,14 @@ VKAPI_ATTR VkResult VKAPI_CALL WaitForFences(VkDevice device, uint32_t fenceCoun
                                              const VkFence* pFences,
                                              VkBool32 waitAll, uint64_t timeout);
 
+VKAPI_ATTR VkResult VKAPI_CALL CreateSemaphore(
+    VkDevice device, const VkSemaphoreCreateInfo* pCreateInfo,
+    const VkAllocationCallbacks* pAllocator, VkSemaphore* pSemaphore);
+
+VKAPI_ATTR void VKAPI_CALL DestroySemaphore(
+    VkDevice device, VkSemaphore semaphore,
+    const VkAllocationCallbacks* pAllocator);
+
 // ---------------------------------------------------------------------------
 // M2: images
 // ---------------------------------------------------------------------------

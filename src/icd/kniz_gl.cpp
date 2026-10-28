@@ -231,6 +231,7 @@ constexpr ProcSlot kRenderProcs[] = {
      "glCheckFramebufferStatus"},
     {&f.DrawBuffers, sizeof(f.DrawBuffers), "glDrawBuffers"},
     {&f.ClearBufferfv, sizeof(f.ClearBufferfv), "glClearBufferfv"},
+    {&f.ClearBufferfi, sizeof(f.ClearBufferfi), "glClearBufferfi"},
     {&f.GenVertexArrays, sizeof(f.GenVertexArrays), "glGenVertexArrays"},
     {&f.DeleteVertexArrays, sizeof(f.DeleteVertexArrays), "glDeleteVertexArrays"},
     {&f.BindVertexArray, sizeof(f.BindVertexArray), "glBindVertexArray"},
@@ -251,6 +252,9 @@ constexpr ProcSlot kRenderProcs[] = {
     {&f.CullFace, sizeof(f.CullFace), "glCullFace"},
     {&f.FrontFace, sizeof(f.FrontFace), "glFrontFace"},
     {&f.ColorMask, sizeof(f.ColorMask), "glColorMask"},
+    {&f.DepthMask, sizeof(f.DepthMask), "glDepthMask"},
+    {&f.DepthFunc, sizeof(f.DepthFunc), "glDepthFunc"},
+    {&f.DepthRange, sizeof(f.DepthRange), "glDepthRange"},
     {&f.ReadPixels, sizeof(f.ReadPixels), "glReadPixels"},
 };
 

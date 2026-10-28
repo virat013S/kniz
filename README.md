@@ -37,13 +37,13 @@ The honest, reachable goal:
 
 ## Status
 
-**M3a complete.** Kniz registers as a Vulkan ICD, the loader hands it an instance
+**M3b complete.** Kniz registers as a Vulkan ICD, the loader hands it an instance
 and a device, it brings up a real OpenGL context to back them, and it can run a
 compute shader over storage buffers and uniform buffers, move image contents to
 and from buffers, draw textured geometry into an image through a render pass and a
 graphics pipeline, with uniform buffers, push constants, samplers and textures
-reaching both kinds of shader — and create a swapchain on an X11 window and
-present to it.
+reaching both kinds of shader, test and write depth against a D16 attachment —
+and create a swapchain on an X11 window and present to it. `vkcube` runs.
 
 Working today:
 
@@ -80,11 +80,22 @@ Working today:
   followed by `eglSwapBuffers` — verified by comparing the frame the driver was
   about to swap against the image it was told to draw, pixel for pixel and
   orientation included, rather than by looking at a window
+- Depth attachments (D16_UNORM): render-pass clear and load operations, the
+  pipeline's depth test, write mask and compare operation, and `gl_Position.z`
+  for every depth in `[0, 1]` — verified by a chain of nine passes where each
+  pass's outcome depends on the buffer the previous one left behind, with both
+  the colour attachment and the depth attachment read back every time. Binary
+  semaphores are objects but carry no state, because submission and present are
+  synchronous; timeline ones are refused at creation.
+- `vkcube`, the canonical smoke test, runs and spins until closed — it had been
+  the first application to demand depth and to find two real driver bugs along
+  the way, both now fixed and pinned by the depth test below.
 
-Not implemented: depth and stencil attachments, blending, multisampling,
-instancing, geometry and tessellation stages, dynamic uniform buffers, comparison
-samplers, anisotropic filtering, mip levels above 0, Wayland surfaces, and every
-swapchain format but `VK_FORMAT_R8G8B8A8_UNORM`. Each is refused with a specific
+Not implemented: the stencil test, the depth bounds test, depth clamping and
+depth bias, blending, multisampling, instancing, geometry and tessellation
+stages, dynamic uniform buffers, comparison samplers, anisotropic filtering, mip
+levels above 0, timeline semaphores, Wayland surfaces, and every swapchain format
+but `VK_FORMAT_R8G8B8A8_UNORM`. Each is refused with a specific
 error at the point the application reveals it needs one, rather than accepted and
 silently ignored. Three refusals are permanent rather than pending, and all three
 are argued in [`docs/DESIGN.md`](docs/DESIGN.md):
@@ -96,8 +107,8 @@ are argued in [`docs/DESIGN.md`](docs/DESIGN.md):
 - `VK_PRESENT_MODE_MAILBOX_KHR` and `IMMEDIATE` — presentation is synchronous, so
   there is no queue to drop a frame from or to skip.
 
-Next is M3b: depth and stencil attachments, which is what `vkcube` needs before it
-will draw anything.
+Next is Wayland surfaces, which is what a Wayland-only session needs before the
+swapchain path works at all there.
 
 ## Building
 
@@ -210,10 +221,12 @@ What is implemented
   textures in shaders                      yes  M2d (combined or separate)
   swapchain / window presentation          yes  M3 (X11 windows, FIFO)
   acquire / present / image cycling        yes  M3
+  depth attachment, depth test/write/compare yes  M3b (stencil and depth bounds refused)
+  binary semaphores                        yes  M3b (no state: submission and present are synchronous)
   linear tiling (layout is observable)     no   never planned
   images: storage, input attachments       no   not implemented
   mapping an image's allocation            no   impossible, see DESIGN.md
-  depth, stencil, blending, multisampling  no   M2b refused on purpose
+  stencil, depth bounds, blending, multisampling no   refused on purpose, see DESIGN.md
   dynamic uniform buffers                  no   M2c refused on purpose
   push constants: non-std140 packing       no   OpenGL cannot express it, see DESIGN.md
   comparison samplers, anisotropy          no   M2d refused on purpose
@@ -238,17 +251,20 @@ What is implemented
   than from the image.  A swapchain is created on an X11 window, drawn into
   through an ordinary render pass, and presented: the frame that is about to
   be shown is read back and compared against the image, so the present path
-  is checked rather than looked at.
+  is checked rather than looked at.  A D16 depth attachment can be cleared,
+  tested with the pipeline's compare operation, written and loaded across a
+  pass; vkcube draws and spins through the whole stack.
 
   Not implemented yet, and refused with a specific error rather than
-  approximated: depth and stencil, blending, multisampling, instancing,
-  geometry and tessellation stages, more than one subpass or a depth
-  attachment, dynamic uniform buffers, comparison samplers, anisotropic
-  filtering, mip levels above 0, Wayland surfaces, and every swapchain
-  format but R8G8B8A8_UNORM.
+  approximated: the stencil test, the depth bounds test, depth clamping and
+  depth bias, blending, multisampling, instancing, geometry and tessellation
+  stages, more than one subpass, input attachments, dynamic uniform buffers,
+  comparison samplers, anisotropic filtering, mip levels above 0, timeline
+  semaphores, Wayland surfaces, and every swapchain format but
+  R8G8B8A8_UNORM.
   Programs that create a device, ask questions about it, run a compute shader
-  over buffers, move image contents, draw geometry textured from uniform and
-  sampler data, or draw into a window will work.
+  over buffers, move image contents, draw depth-tested geometry textured from
+  uniform and sampler data, or draw into a window will work.
   See docs/DESIGN.md for what OpenGL cannot express at all.
 
   The 'kniz:' lines above are the driver's own log, including the
@@ -292,7 +308,7 @@ Set `KNIZ_LOG=0..4` (`error`..`trace`) to control logging; the default is `2`.
 ctest --test-dir build --output-on-failure
 ```
 
-Five tests, all driven through the **real Vulkan loader** rather than by calling
+Eight tests, all driven through the **real Vulkan loader** rather than by calling
 the ICD directly. That is deliberate: the most damaging class of ICD bug — a
 dispatchable object that does not reserve its first word for the loader's
 dispatch pointer — is invisible when the ICD is called directly, and produces a
@@ -328,9 +344,10 @@ See the note in [`docs/DESIGN.md`](docs/DESIGN.md).
   shader writes `gl_FragCoord` back out, so the rasteriser is asked where it thinks
   each fragment is instead of being told — which is also what pins down the clip
   space depth conversion, since a vertex written at Vulkan depth 0.25 has to read
-  back as 0.25 rather than as 0.625. The refusals — a second subpass, a depth
-  attachment, an input attachment, blending, a geometry stage, an integer vertex
-  format, a pipeline used with another render pass — are asserted too.
+  back as 0.25 rather than as 0.625. The refusals — a second subpass, a colour
+  format in the depth slot, an input attachment, blending, a geometry stage, an
+  integer vertex format, a pipeline used with another render pass — are asserted
+  too.
 - `uniform` — uniform buffers and push constants (M2c). Two uniform blocks are
   placed at the *same* binding number in *different* descriptor sets, which Vulkan
   allows and GLSL cannot express: GL numbers uniform blocks in one flat namespace,
@@ -384,13 +401,37 @@ See the note in [`docs/DESIGN.md`](docs/DESIGN.md).
   and a frame scaled to a size the test did not choose cannot be compared pixel
   for pixel.
 
+- `depth` — depth attachments, the depth test and depth writes (M3b). Nine passes
+  are recorded against the same 64×64 colour+depth framebuffer pair, and each
+  phase's outcome depends on what the previous phase left in the buffer, so a
+  quiet reallocation, a re-clear or a lost load operation flips colour early: a
+  clear to a non-default 0.5 must reject a draw at 0.75; a draw at 0.25 must then
+  pass and write; a pass with `loadOp LOAD` must still hold 0.25 and reject 0.75
+  again; a nearer draw at 0.1 must pass against that; clearing again must put 0.5
+  back (checked in the depth readback, since 0.9 is rejected either way); a
+  pipeline with the test disabled and writes enabled must still write, which GL
+  does not do for a genuinely disabled depth test and which the driver maps to
+  `GL_ALWAYS` instead; the written 0.9 must be seen by the next pass; a
+  `VK_COMPARE_OP_GREATER` pipeline must accept the draw `LESS` rejected; and a
+  pipeline with writes off must test without writing. Every phase checks the whole
+  colour attachment and the whole depth attachment — against `round(z · 65535)`
+  with two counts of slack, in the way a D16 conversion rounds — rather than a
+  sampling of either. `vkGetPhysicalDeviceFormatProperties` is checked to agree
+  with what the driver accepts, which is not decoration: vkcube asked it whether
+  an sRGB format could be sampled, was told no by an earlier stub, and skipped
+  creating its texture. The refusals follow: depth format with sampled or colour
+  usage, colour format with depth usage in an image, a render pass, or a
+  framebuffer's depth slot; a stencil-aspect clear of a packed format; the
+  stencil test and the depth bounds test in a pipeline; and a timeline semaphore
+  at creation.
+
 The shaders the tests use are checked in twice: as GLSL, and as the compiled
 SPIR-V an application would actually submit. The command that regenerates each
 SPIR-V file is recorded at the top of the GLSL it came from
 (`tests/shaders/scale.comp`, the four that `draw` uses, the four that `uniform`
-uses, the four that `sampler` uses and the two that `present` reuses from `draw`),
-and the compiled forms are committed so that the test suite does not depend on
-`glslangValidator` being installed.
+uses, the four that `sampler` uses, the two that `present` reuses from `draw` and
+the two that `depth` uses), and the compiled forms are committed so that the test
+suite does not depend on `glslangValidator` being installed.
 
 ## Layout
 

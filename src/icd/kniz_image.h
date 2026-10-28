@@ -29,6 +29,15 @@ inline constexpr VkImageCreateFlags kUnimplementedImageFlags =
 inline constexpr VkImageUsageFlags kUnimplementedImageUsage =
     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
 
+// What a depth or depth/stencil image may be used for.  Sampling a depth texture
+// is legal Vulkan and would work in GL, but nothing in this driver has been
+// tested through that path -- the sampler lowering, the shader's declared type and
+// the comparison are all different for depth -- so it is refused rather than
+// offered and left to produce a plausible, wrong value.
+inline constexpr VkImageUsageFlags kDepthImageUsage =
+    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
 // The GL representation of one Vulkan format.
 struct ImageFormat {
   VkFormat vk = VK_FORMAT_UNDEFINED;
@@ -46,11 +55,28 @@ struct ImageFormat {
   // Depth or depth/stencil.  Such a format cannot be the target of
   // vkCmdClearColorImage, and is not a colour attachment.
   bool depth = false;
+
+  // A depth/stencil format has both aspects, and GL attaches it at
+  // GL_DEPTH_STENCIL_ATTACHMENT rather than GL_DEPTH_ATTACHMENT.  The two
+  // attachment points are not interchangeable: a packed format at the depth-only
+  // point makes the framebuffer incomplete.
+  bool stencil = false;
 };
 
 // Null when the format is not one Kniz can present as a texture.  Callers report
 // the numeric value, since no name is available.
 const ImageFormat* image_format(VkFormat format);
+
+// What vkGetPhysicalDeviceFormatProperties reports for a format: the same
+// features vkCreateImage and the render pass actually accept, derived from the
+// table above so that the answer and the behaviour cannot drift apart.
+//
+// This matters more than it looks.  Applications ask before they act, and a
+// format reported as having no features makes them take a fallback path -- vkcube
+// asks whether R8G8B8A8_SRGB can be sampled, and when told no, it builds its
+// texture as a linear image instead and never creates the optimal one at all.
+// Answering "nothing is supported" is not conservative, it is wrong.
+VkFormatFeatureFlags format_features(VkFormat format);
 
 // Bytes a tightly packed image of this description would occupy.  Not a GL
 // concept: GL allocates whatever its own layout needs, and this number exists

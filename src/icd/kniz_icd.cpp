@@ -485,12 +485,19 @@ VKAPI_ATTR void VKAPI_CALL GetPhysicalDeviceFormatProperties(
     VkPhysicalDevice physicalHandle, VkFormat format,
     VkFormatProperties* pFormatProperties) {
   (void)physicalHandle;
-  (void)format;
   if (pFormatProperties == nullptr)
     return;
-  // M0 has no format database.  Reporting uniform "nothing is supported" is
-  // honest; M2 adds the VkFormat <-> GL internal format table.
-  std::memset(pFormatProperties, 0, sizeof(*pFormatProperties));
+  // Answered from the same table vkCreateImage and the render pass consult, so
+  // that what is promised here and what is accepted there cannot disagree.
+  //
+  // Until M3b this function reported nothing at all, which is not the conservative
+  // answer it looks like: applications branch on it, and "no features" sends them
+  // down fallback paths that then fail somewhere else.  vkcube asks whether
+  // R8G8B8A8_SRGB can be sampled, is told no, skips creating its texture entirely,
+  // and presents a null image view -- a failure three steps away from its cause.
+  pFormatProperties->linearTilingFeatures = 0;
+  pFormatProperties->optimalTilingFeatures = format_features(format);
+  pFormatProperties->bufferFeatures = 0;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceImageFormatProperties(
@@ -516,6 +523,12 @@ VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceImageFormatProperties(
     return VK_ERROR_FORMAT_NOT_SUPPORTED;
   if ((usage & kUnimplementedImageUsage) != 0)
     return VK_ERROR_FORMAT_NOT_SUPPORTED;
+  if (info->depth) {
+    if ((usage & ~kDepthImageUsage) != 0)
+      return VK_ERROR_FORMAT_NOT_SUPPORTED;
+  } else if ((usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0) {
+    return VK_ERROR_FORMAT_NOT_SUPPORTED;
+  }
 
   // 4096 is what fill_limits advertises as maxImageDimension2D.  The backend
   // would accept more on most drivers -- vkCreateImage goes by GL's own query --

@@ -133,6 +133,39 @@ void render_begin_pass(const RecordedCommand& command) {
     gl::f.ClearBufferfv(gl::kColor, static_cast<gl::Int>(slot), value);
   }
 
+  // The depth attachment's clear, if it has one.  It comes after the colour
+  // clears because glClearBufferfv names a buffer rather than a draw buffer slot,
+  // so the order does not matter for correctness -- but the depth mask does have
+  // to be on for the clear to land, for the same reason the colour mask is forced
+  // above: whether a clear honours the write mask is not a thing to rely on.
+  if (pass->depth_attachment != VK_ATTACHMENT_UNUSED &&
+      pass->depth_attachment < pass->attachments.size()) {
+    const VkAttachmentDescription& attachment =
+        pass->attachments[pass->depth_attachment];
+    if (attachment.loadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+      if ((pass->depth_attachment + 1) * kClearValueBytes >
+          command.clear_values.size()) {
+        KNIZ_ERR("the render pass clear values do not cover depth attachment %u",
+                 pass->depth_attachment);
+      } else {
+        const auto* value = reinterpret_cast<const VkClearDepthStencilValue*>(
+            command.clear_values.data() +
+            pass->depth_attachment * kClearValueBytes);
+        const ImageFormat* format = image_format(attachment.format);
+        gl::f.DepthMask(1);
+        if (format != nullptr && format->stencil &&
+            attachment.stencilLoadOp == VK_ATTACHMENT_LOAD_OP_CLEAR) {
+          // One call clears both aspects of a packed format, which is why render
+          // pass creation refuses a stencil-only clear.
+          gl::f.ClearBufferfi(gl::kDepthStencil, 0, value->depth,
+                              static_cast<gl::Int>(value->stencil));
+        } else {
+          gl::f.ClearBufferfv(gl::kDepth, 0, &value->depth);
+        }
+      }
+    }
+  }
+
   gl::report_errors("after clearing the render pass's attachments");
 }
 
@@ -242,6 +275,29 @@ void render_draw(const RecordedCommand& command) {
   }
   gl::f.FrontFace(pipeline->front_face);
 
+  // Depth state.  GL and Vulkan disagree about what "no depth test" means: Vulkan
+  // keeps depthWriteEnable in force regardless, while GL stops updating the depth
+  // buffer altogether the moment the test is disabled -- on both the Intel driver
+  // and llvmpipe, a draw with GL_DEPTH_TEST off and glDepthMask(GL_TRUE) leaves
+  // the depth attachment exactly as it was.  So a Vulkan pipeline that turns the
+  // test off but still writes becomes an always-passing test instead, which
+  // writes unconditionally by the same route every other draw does, and a
+  // pipeline with neither ends as the only shape GL has for that: the test off.
+  if (pipeline->depth_test || pipeline->depth_write) {
+    gl::f.Enable(gl::kDepthTest);
+    gl::f.DepthFunc(pipeline->depth_test ? pipeline->depth_func
+                                         : gl::kAlways);
+    gl::f.DepthMask(pipeline->depth_write ? 1u : 0u);
+  } else {
+    gl::f.Disable(gl::kDepthTest);
+  }
+  // Vulkan puts the depth range in the viewport, so it comes from whichever
+  // viewport this draw recorded.  GL's default is [0, 1] as well, and the
+  // clip-space fixup means NDC z already carries Vulkan's convention, so the
+  // identity mapping is the right one.
+  gl::f.DepthRange(static_cast<double>(command.viewport.minDepth),
+                   static_cast<double>(command.viewport.maxDepth));
+
   // Vulkan's colour write mask and GL's four arguments are the same four bits in
   // the same order.
   gl::f.ColorMask((pipeline->color_write & VK_COLOR_COMPONENT_R_BIT) ? 1u : 0u,
@@ -336,14 +392,21 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateRenderPass(
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
     }
     if (format->depth) {
-      // A depth attachment is not merely unimplemented: it implies depth testing
-      // and depth writes in the pipeline, which are refused too, so accepting the
-      // attachment would only move the failure somewhere less explicable.
-      KNIZ_ERR("attachment %u has depth format %d, and depth attachments are not "
-               "implemented yet",
-               i, static_cast<int>(attachment.format));
-      delete pass;
-      return VK_ERROR_FEATURE_NOT_PRESENT;
+      // Whether this attachment may be a depth target depends on the subpass,
+      // which is not read yet; that is checked below, together with the colour
+      // attachments' formats.  What can be settled here is the stencil clear: a
+      // packed format's two aspects are cleared together by GL, so clearing only
+      // the stencil half has no counterpart.
+      if (format->stencil &&
+          attachment.stencilLoadOp == VK_ATTACHMENT_LOAD_OP_CLEAR &&
+          attachment.loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR) {
+        KNIZ_ERR("attachment %u clears only its stencil aspect; OpenGL clears a "
+                 "packed depth/stencil attachment's two aspects with one call, so "
+                 "the depth aspect has to be cleared with it",
+                 i);
+        delete pass;
+        return VK_ERROR_FEATURE_NOT_PRESENT;
+      }
     }
     if (attachment.initialLayout == VK_IMAGE_LAYOUT_PREINITIALIZED &&
         attachment.loadOp == VK_ATTACHMENT_LOAD_OP_LOAD) {
@@ -369,9 +432,24 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateRenderPass(
   }
   if (subpass.pDepthStencilAttachment != nullptr &&
       subpass.pDepthStencilAttachment->attachment != VK_ATTACHMENT_UNUSED) {
-    KNIZ_ERR("a depth/stencil attachment is not implemented yet");
-    delete pass;
-    return VK_ERROR_FEATURE_NOT_PRESENT;
+    const uint32_t index = subpass.pDepthStencilAttachment->attachment;
+    if (index >= pCreateInfo->attachmentCount) {
+      KNIZ_ERR("the subpass's depth/stencil attachment refers to attachment %u, "
+               "which the render pass does not declare",
+               index);
+      delete pass;
+      return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    const ImageFormat* depth_format =
+        image_format(pCreateInfo->pAttachments[index].format);
+    if (depth_format == nullptr || !depth_format->depth) {
+      KNIZ_ERR("the subpass's depth/stencil attachment %u has format %d, which is "
+               "not a depth or depth/stencil format",
+               index, static_cast<int>(pCreateInfo->pAttachments[index].format));
+      delete pass;
+      return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    pass->depth_attachment = index;
   }
   if (subpass.pResolveAttachments != nullptr) {
     for (uint32_t i = 0; i < subpass.colorAttachmentCount; ++i) {
@@ -400,6 +478,17 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateRenderPass(
       delete pass;
       return VK_ERROR_INITIALIZATION_FAILED;
     }
+    const ImageFormat* colour_format =
+        image_format(pCreateInfo->pAttachments[reference.attachment].format);
+    if (colour_format != nullptr && colour_format->depth) {
+      KNIZ_ERR("the subpass's colour attachment %u is attachment %u, which has "
+               "depth format %d",
+               i, reference.attachment,
+               static_cast<int>(pCreateInfo->pAttachments[reference.attachment]
+                                    .format));
+      delete pass;
+      return VK_ERROR_INITIALIZATION_FAILED;
+    }
     pass->color_attachments.push_back(reference.attachment);
   }
 
@@ -410,6 +499,11 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateRenderPass(
   // vkCmdBeginRenderPass that would have to do it.
   for (uint32_t i = 0; i < pCreateInfo->attachmentCount; ++i) {
     if (pCreateInfo->pAttachments[i].loadOp != VK_ATTACHMENT_LOAD_OP_CLEAR)
+      continue;
+    // The depth attachment is cleared through glClearBufferfv or glClearBufferfi,
+    // which name the buffer rather than a draw buffer slot, so it needs no entry
+    // in the colour list.
+    if (i == pass->depth_attachment)
       continue;
     uint32_t slot = 0;
     if (!subpass_slot_for_attachment(pass, i, &slot)) {
@@ -423,8 +517,10 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateRenderPass(
   }
 
   *pRenderPass = to_handle(pass);
-  KNIZ_INFO("render pass created: %u attachment(s), %zu colour attachment(s)",
-            pCreateInfo->attachmentCount, pass->color_attachments.size());
+  KNIZ_INFO("render pass created: %u attachment(s), %zu colour attachment(s), %s "
+            "depth attachment",
+            pCreateInfo->attachmentCount, pass->color_attachments.size(),
+            pass->depth_attachment == VK_ATTACHMENT_UNUSED ? "no" : "one");
   return VK_SUCCESS;
 }
 
@@ -501,7 +597,20 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateFramebuffer(
       delete framebuffer;
       return VK_ERROR_INITIALIZATION_FAILED;
     }
-    if ((view->image->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) == 0) {
+    // Which usage bit the attachment needs depends on the role the subpass gives
+    // it, and the two are not interchangeable: a colour image in the depth slot
+    // would be attached where GL will not put it, and a depth image in a colour
+    // slot would be drawn into with no depth buffer behind the test.
+    if (i == pass->depth_attachment) {
+      if ((view->image->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) == 0) {
+        KNIZ_ERR("framebuffer attachment %u is the render pass's depth attachment "
+                 "but its image was created without "
+                 "VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT",
+                 i);
+        delete framebuffer;
+        return VK_ERROR_INITIALIZATION_FAILED;
+      }
+    } else if ((view->image->usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) == 0) {
       KNIZ_ERR("framebuffer attachment %u is an image created without "
                "VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT",
                i);
@@ -536,9 +645,21 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateFramebuffer(
 
   gl::f.BindFramebuffer(gl::kFramebuffer, framebuffer->gl_framebuffer);
   for (uint32_t i = 0; i < pCreateInfo->attachmentCount; ++i) {
-    gl::f.FramebufferTexture2D(
-        gl::kFramebuffer, static_cast<gl::Enum>(gl::kColorAttachment0 + i),
-        gl::kTexture2D, framebuffer->attachments[i]->image->gl_texture, 0);
+    gl::Enum attachment_point =
+        static_cast<gl::Enum>(gl::kColorAttachment0 + i);
+    if (i == pass->depth_attachment) {
+      // A packed depth/stencil format has to be attached at
+      // GL_DEPTH_STENCIL_ATTACHMENT; attaching it at GL_DEPTH_ATTACHMENT leaves
+      // the stencil aspect unattached and makes the framebuffer incomplete.
+      const ImageFormat* format =
+          image_format(framebuffer->attachments[i]->format);
+      attachment_point = (format != nullptr && format->stencil)
+                             ? gl::kDepthStencilAttachment
+                             : gl::kDepthAttachment;
+    }
+    gl::f.FramebufferTexture2D(gl::kFramebuffer, attachment_point,
+                               gl::kTexture2D,
+                               framebuffer->attachments[i]->image->gl_texture, 0);
   }
 
   // The draw buffer list is the subpass's colour attachment list, in the order

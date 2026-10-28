@@ -143,6 +143,10 @@ const Entry kEntries[] = {
     {"vkResetFences", as_entry(ResetFences)},
     {"vkGetFenceStatus", as_entry(GetFenceStatus)},
     {"vkWaitForFences", as_entry(WaitForFences)},
+    // Binary semaphores.  Submission is synchronous, so these are handles with no
+    // state to keep; see kniz_objects.h.
+    {"vkCreateSemaphore", as_entry(CreateSemaphore)},
+    {"vkDestroySemaphore", as_entry(DestroySemaphore)},
 };
 
 }  // namespace

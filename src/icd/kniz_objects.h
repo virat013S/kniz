@@ -47,6 +47,7 @@ inline constexpr uint64_t kPipelineCacheMagic = 0x4B4E495A50434143ull;   // KNIZ
 inline constexpr uint64_t kCommandPoolMagic = 0x4B4E495A43504F4Full;     // KNIZCPOO
 inline constexpr uint64_t kCommandBufferMagic = 0x4B4E495A434D4442ull;   // KNIZCMDB
 inline constexpr uint64_t kFenceMagic = 0x4B4E495A46454E43ull;           // KNIZFENC
+inline constexpr uint64_t kSemaphoreMagic = 0x4B4E495A53454D41ull;       // KNIZSEMA
 inline constexpr uint64_t kImageMagic = 0x4B4E495A494D4147ull;           // KNIZIMAG
 inline constexpr uint64_t kImageViewMagic = 0x4B4E495A49565757ull;       // KNIZIVWW
 inline constexpr uint64_t kSamplerMagic = 0x4B4E495A534D504Cull;         // KNIZSMPL
@@ -529,6 +530,14 @@ struct Pipeline {
   gl::Enum cull_face = gl::kNone;
   gl::Enum front_face = gl::kCcw;
   VkColorComponentFlags color_write = 0xF;
+
+  // Depth state (M3b).  GL keeps all three in the context, so they are captured
+  // here and applied at replay with the rest of the fixed state.  The depth range
+  // is not here: it belongs to the viewport, and comes from whichever viewport the
+  // draw recorded.
+  bool depth_test = false;
+  bool depth_write = false;
+  gl::Enum depth_func = gl::kLess;
 };
 
 // ---------------------------------------------------------------------------
@@ -713,6 +722,23 @@ struct Fence {
   bool signaled = false;
 };
 
+// A binary semaphore, which in this driver is a handle and nothing else.
+//
+// Kniz runs every submission and every present to completion before the call
+// returns, so no work is ever in flight and there is nothing for a semaphore to
+// order: vkQueueSubmit ignores the ones it is given and vkQueuePresentKHR does
+// the same, which is documented in DESIGN.md.  The object exists because every
+// application that presents creates one, and a driver that returns null from
+// vkGetDeviceProcAddr for vkCreateSemaphore does not fail politely -- it makes
+// the application jump through address zero.
+//
+// Timeline semaphores are a different object with real state, and are refused at
+// creation rather than accepted and ignored.
+struct Semaphore {
+  uint64_t magic = kSemaphoreMagic;
+  Device* device = nullptr;
+};
+
 // Kniz does not cache anything across pipelines: it compiles GLSL on every
 // vkCreateComputePipelines call and the driver's own program cache does the
 // real work.  The handle exists because applications create one unconditionally
@@ -809,6 +835,11 @@ struct RenderPass {
   // that subpass attachment i is GL_COLOR_ATTACHMENTi, which is the mapping
   // glDrawBuffers and glClearBufferfv both assume.
   std::vector<uint32_t> color_attachments;
+
+  // The subpass's depth/stencil attachment, or VK_ATTACHMENT_UNUSED.  There is at
+  // most one, which is GL's rule as well: a GL framebuffer has one depth
+  // attachment, and a Vulkan render pass would need a second subpass to have two.
+  uint32_t depth_attachment = VK_ATTACHMENT_UNUSED;
 };
 
 // A framebuffer binds specific image views to a render pass's attachments.  On
@@ -984,6 +1015,10 @@ inline Fence* from_handle(VkFence handle) {
   return detail::to_object<Fence>(kFenceMagic, handle);
 }
 
+inline Semaphore* from_handle(VkSemaphore handle) {
+  return detail::to_object<Semaphore>(kSemaphoreMagic, handle);
+}
+
 inline PipelineCache* from_handle(VkPipelineCache handle) {
   return detail::to_object<PipelineCache>(kPipelineCacheMagic, handle);
 }
@@ -1103,6 +1138,10 @@ inline VkCommandBuffer to_handle(CommandBuffer* object) {
 
 inline VkFence to_handle(Fence* object) {
   return reinterpret_cast<VkFence>(object);
+}
+
+inline VkSemaphore to_handle(Semaphore* object) {
+  return reinterpret_cast<VkSemaphore>(object);
 }
 
 inline VkPipelineCache to_handle(PipelineCache* object) {
