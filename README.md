@@ -37,13 +37,13 @@ The honest, reachable goal:
 
 ## Status
 
-**M2d complete.** Kniz registers as a Vulkan ICD, the loader hands it an instance
+**M3a complete.** Kniz registers as a Vulkan ICD, the loader hands it an instance
 and a device, it brings up a real OpenGL context to back them, and it can run a
 compute shader over storage buffers and uniform buffers, move image contents to
-and from buffers, and draw textured geometry into an image through a render pass
-and a graphics pipeline, with uniform buffers, push constants, samplers and
-textures reaching both kinds of shader. It does not present anything to a window
-yet.
+and from buffers, draw textured geometry into an image through a render pass and a
+graphics pipeline, with uniform buffers, push constants, samplers and textures
+reaching both kinds of shader — and create a swapchain on an X11 window and
+present to it.
 
 Working today:
 
@@ -74,21 +74,30 @@ Working today:
   against a CPU evaluation of the same filtering, with the same image read through
   two different samplers and two images at the same binding number in different
   sets, which are the two ways a texture path can be quietly wrong
+- Surfaces, swapchains and presentation on an X11 window: the images a swapchain
+  hands out are ordinary GL textures, so a render pass draws into one with no new
+  code, and `vkQueuePresentKHR` is a draw from that texture into the window
+  followed by `eglSwapBuffers` — verified by comparing the frame the driver was
+  about to swap against the image it was told to draw, pixel for pixel and
+  orientation included, rather than by looking at a window
 
 Not implemented: depth and stencil attachments, blending, multisampling,
 instancing, geometry and tessellation stages, dynamic uniform buffers, comparison
-samplers, anisotropic filtering, mip levels above 0, and presentation. Each is
-refused with a specific error at the point the application reveals it needs one,
-rather than accepted and silently ignored. Two refusals are permanent rather than
-pending, and both are argued in
-[`docs/DESIGN.md`](docs/DESIGN.md):
+samplers, anisotropic filtering, mip levels above 0, Wayland surfaces, and every
+swapchain format but `VK_FORMAT_R8G8B8A8_UNORM`. Each is refused with a specific
+error at the point the application reveals it needs one, rather than accepted and
+silently ignored. Three refusals are permanent rather than pending, and all three
+are argued in [`docs/DESIGN.md`](docs/DESIGN.md):
 
 - `VK_IMAGE_TILING_LINEAR` — a linear image's layout is observable and OpenGL's
   storage layout is not it.
 - Mapping a `VkDeviceMemory` that an image is bound to — an image is a GL
   texture, so the allocation does not hold its pixels.
+- `VK_PRESENT_MODE_MAILBOX_KHR` and `IMMEDIATE` — presentation is synchronous, so
+  there is no queue to drop a frame from or to skip.
 
-Next is M3 for a swapchain and a window, which is what `vkcube` needs.
+Next is M3b: depth and stencil attachments, which is what `vkcube` needs before it
+will draw anything.
 
 ## Building
 
@@ -137,15 +146,52 @@ Run with no arguments, `./kniz` executes `kniz-info`, which reports what the ICD
 gives an application and how much of Vulkan is actually implemented:
 
 ```
+Driver
+  manifest               /home/mitsuki/Projects/kniz/build/src/kniz_icd.json
+  selected by            VK_DRIVER_FILES
+  loader                 libvulkan.so.1
+  loader API             1.4.363
+kniz: [info] OpenGL 4.6 core context: Mesa Intel(R) HD Graphics 4400 (HSW GT2) / 4.6 (Core Profile) Mesa 26.2.4-arch3.1
+kniz: [info] compute shaders available; shader storage buffer offset alignment 4
+kniz: [info] uniform buffers available; uniform buffer offset alignment 32
+kniz: [info] images available: textures, with glTexStorage2D, glClearTexImage and glGetTexImage
+kniz: [info] samplers available: sampler objects, 160 texture unit(s)
+kniz: [info] presentation available: X11 windows, through EGL on the X11 platform
+kniz: [info] rendering available: framebuffer objects, vertex array objects, draws
+kniz: [info] instance created: requested Vulkan 1.0, exposing 1.0
+
 Instance
   vkCreateInstance       ok
   physical devices       1
 
 Device
   name                   Kniz on Mesa Intel(R) HD Graphics 4400 (HSW GT2)
+  type                   other (Kniz does not claim to be real hardware)
   vendorID               0x4b4e  (Kniz)
+  deviceID               0x2617
   apiVersion             1.0.0
-  device extensions      0
+  driverVersion          0.0.1
+  device extensions      1
+
+Queues and memory
+  families               0: 1 queue(s), graphics compute transfer
+  heaps                  0: 1024 MiB, device local
+  types                  0: heap 0, device-local
+                         1: heap 0, device-local host-visible host-coherent
+
+Limits (Vulkan's required floor)
+  maxImage2D             4096
+  maxUBO range           16384
+  maxSSBO range          134217728
+  maxDescSets            4
+  maxWorkGroup           128 x 128 x 64
+  maxViewports           1
+kniz: [info] device created (queue family 0)
+
+Device creation
+  vkCreateDevice         ok
+  vkGetDeviceQueue       ok
+  vkDeviceWaitIdle       ok
 
 What is implemented
   loader handshake, instance/device        yes  M0
@@ -162,6 +208,8 @@ What is implemented
   push constants                           yes  M2c (lowered onto a uniform buffer)
   samplers                                 yes  M2d (GL sampler objects)
   textures in shaders                      yes  M2d (combined or separate)
+  swapchain / window presentation          yes  M3 (X11 windows, FIFO)
+  acquire / present / image cycling        yes  M3
   linear tiling (layout is observable)     no   never planned
   images: storage, input attachments       no   not implemented
   mapping an image's allocation            no   impossible, see DESIGN.md
@@ -170,8 +218,43 @@ What is implemented
   push constants: non-std140 packing       no   OpenGL cannot express it, see DESIGN.md
   comparison samplers, anisotropy          no   M2d refused on purpose
   sampling mip levels above 0              no   only level 0 is ever written, see DESIGN.md
-  swapchain / window presentation          no   M3
+  Wayland surfaces                         no   the EGL context is on X11, see DESIGN.md
+  sRGB and BGRA swapchain formats          no   M3 refused on purpose
+  MAILBOX and IMMEDIATE present modes      no   presentation is synchronous, see DESIGN.md
   fences, queries, timestamps              no   M4
+
+  Images exist and their contents move correctly -- a buffer to image and
+  back again returns the bytes it was given, a clear lands as the exact
+  texels its float value denotes, and a sub-rectangle copy respects both its
+  offset and a padded buffer row length.  Lines and triangles are drawn into
+  an image through a render pass, a graphics pipeline and one or two vertex
+  buffers, and the result is checked against a CPU rasterisation of the same
+  geometry rather than merely eyeballed.  Uniform buffers are read by both
+  compute and graphics shaders, including two blocks that share a binding
+  number in different sets, and push constants arrive in the shader that
+  declared them.  Textures are sampled in both compute and graphics shaders,
+  through combined image samplers and through a separate image and sampler,
+  with the filter and address modes coming from the sampler object rather
+  than from the image.  A swapchain is created on an X11 window, drawn into
+  through an ordinary render pass, and presented: the frame that is about to
+  be shown is read back and compared against the image, so the present path
+  is checked rather than looked at.
+
+  Not implemented yet, and refused with a specific error rather than
+  approximated: depth and stencil, blending, multisampling, instancing,
+  geometry and tessellation stages, more than one subpass or a depth
+  attachment, dynamic uniform buffers, comparison samplers, anisotropic
+  filtering, mip levels above 0, Wayland surfaces, and every swapchain
+  format but R8G8B8A8_UNORM.
+  Programs that create a device, ask questions about it, run a compute shader
+  over buffers, move image contents, draw geometry textured from uniform and
+  sampler data, or draw into a window will work.
+  See docs/DESIGN.md for what OpenGL cannot express at all.
+
+  The 'kniz:' lines above are the driver's own log, including the
+  OpenGL context it created to back this device.
+
+OK
 ```
 
 The launcher sets `VK_ICD_FILENAMES`, `VK_DRIVER_FILES` and `KNIZ_LOG`, so you can
@@ -282,12 +365,32 @@ See the note in [`docs/DESIGN.md`](docs/DESIGN.md).
   refused at the descriptor write, which is then proved by the draw that would
   have used the binding being refused too.
 
+- `present` — swapchain and presentation (M3a), on an X11 window the test makes
+  for itself through `libX11` opened with `dlopen`, so the build gains no X11
+  dependency and a machine with no display skips the test instead of failing it.
+  The surface reports what it can do and the refusals are asserted — a BGRA
+  format, a display-P3 colour space, one image, MAILBOX, storage usage, a rotated
+  pre-transform, pre-multiplied alpha. A swapchain is created, a triangle is drawn
+  into one of its images and copied back, and the result is compared against a CPU
+  rasterisation of the same vertices. Then the image is presented, and the frame
+  the driver was about to swap is compared against that same reference: the
+  triangle's flat edge and its apex are at opposite ends of the image, so a flip
+  anywhere in the present path moves the apex to the top and fails. A second
+  swapchain half the window's size is cleared and presented, which checks that
+  presentation scales to the window rather than drawing at the image's size.
+  Acquisition is checked to walk the images in order and wrap, and presenting an
+  index the swapchain does not have is checked to be refused. The window is
+  deliberately left unmapped: a mapped window is resized by the window manager,
+  and a frame scaled to a size the test did not choose cannot be compared pixel
+  for pixel.
+
 The shaders the tests use are checked in twice: as GLSL, and as the compiled
 SPIR-V an application would actually submit. The command that regenerates each
 SPIR-V file is recorded at the top of the GLSL it came from
 (`tests/shaders/scale.comp`, the four that `draw` uses, the four that `uniform`
-uses and the four that `sampler` uses), and the compiled forms are committed so
-that the test suite does not depend on `glslangValidator` being installed.
+uses, the four that `sampler` uses and the two that `present` reuses from `draw`),
+and the compiled forms are committed so that the test suite does not depend on
+`glslangValidator` being installed.
 
 ## Layout
 

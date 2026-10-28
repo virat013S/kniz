@@ -417,6 +417,9 @@ int main(int argc, char** argv) {
   capability("push constants", true, "M2c (lowered onto a uniform buffer)");
   capability("samplers", true, "M2d (GL sampler objects)");
   capability("textures in shaders", true, "M2d (combined or separate)");
+  capability("swapchain / window presentation", true,
+             "M3 (X11 windows, FIFO)");
+  capability("acquire / present / image cycling", true, "M3");
   capability("linear tiling (layout is observable)", false, "never planned");
   capability("images: storage, input attachments", false, "not implemented");
   capability("mapping an image's allocation", false, "impossible, see DESIGN.md");
@@ -428,7 +431,12 @@ int main(int argc, char** argv) {
              "M2d refused on purpose");
   capability("sampling mip levels above 0", false,
              "only level 0 is ever written, see DESIGN.md");
-  capability("swapchain / window presentation", false, "M3");
+  capability("Wayland surfaces", false,
+             "the EGL context is on X11, see DESIGN.md");
+  capability("sRGB and BGRA swapchain formats", false,
+             "M3 refused on purpose");
+  capability("MAILBOX and IMMEDIATE present modes", false,
+             "presentation is synchronous, see DESIGN.md");
   capability("fences, queries, timestamps", false, "M4");
 
   std::printf(
@@ -444,15 +452,19 @@ int main(int argc, char** argv) {
       "  declared them.  Textures are sampled in both compute and graphics shaders,\n"
       "  through combined image samplers and through a separate image and sampler,\n"
       "  with the filter and address modes coming from the sampler object rather\n"
-      "  than from the image.\n"
+      "  than from the image.  A swapchain is created on an X11 window, drawn into\n"
+      "  through an ordinary render pass, and presented: the frame that is about to\n"
+      "  be shown is read back and compared against the image, so the present path\n"
+      "  is checked rather than looked at.\n"
       "\n  Not implemented yet, and refused with a specific error rather than\n"
       "  approximated: depth and stencil, blending, multisampling, instancing,\n"
       "  geometry and tessellation stages, more than one subpass or a depth\n"
       "  attachment, dynamic uniform buffers, comparison samplers, anisotropic\n"
-      "  filtering, mip levels above 0, and presentation.\n"
+      "  filtering, mip levels above 0, Wayland surfaces, and every swapchain\n"
+      "  format but R8G8B8A8_UNORM.\n"
       "  Programs that create a device, ask questions about it, run a compute shader\n"
-      "  over buffers, move image contents, or draw geometry textured from uniform\n"
-      "  and sampler data will work.\n"
+      "  over buffers, move image contents, draw geometry textured from uniform and\n"
+      "  sampler data, or draw into a window will work.\n"
       "  See docs/DESIGN.md for what OpenGL cannot express at all.\n"
       "\n  The 'kniz:' lines above are the driver's own log, including the\n"
       "  OpenGL context it created to back this device.\n");

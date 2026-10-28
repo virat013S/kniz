@@ -8,6 +8,8 @@
 #include <dlfcn.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace kniz::gl {
 
@@ -20,6 +22,8 @@ EGLConfig g_config = nullptr;
 EGLSurface g_surface = EGL_NO_SURFACE;
 EGLContext g_context = EGL_NO_CONTEXT;
 bool g_surfaceless = false;
+bool g_window_capable = false;
+WindowPlatform g_platform = WindowPlatform::None;
 
 ContextInfo g_info;
 bool g_attempted = false;
@@ -86,7 +90,30 @@ struct ProcSlot {
 
 void release();
 bool bring_up(EGLDisplay display, bool wants_surface, const char* label);
-bool finish_setup();
+
+// Whether an EGL client extension is present, asked before any display exists.
+bool has_client_extension(const char* name) {
+  const char* extensions = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
+  return extensions != nullptr && std::strstr(extensions, name) != nullptr;
+}
+
+// The window system a display belongs to, as far as its extension string says.
+// Used only for the display obtained from EGL_DEFAULT_DISPLAY, where the
+// platform was not chosen by us; a display we asked for by name is known.
+WindowPlatform platform_of_display(EGLDisplay display) {
+  const char* extensions = eglQueryString(display, EGL_EXTENSIONS);
+  if (extensions == nullptr)
+    return WindowPlatform::Other;
+  if (std::strstr(extensions, "EGL_KHR_platform_x11") != nullptr ||
+      std::strstr(extensions, "EGL_EXT_platform_x11") != nullptr)
+    return WindowPlatform::X11;
+  if (std::strstr(extensions, "EGL_KHR_platform_wayland") != nullptr ||
+      std::strstr(extensions, "EGL_EXT_platform_wayland") != nullptr)
+    return WindowPlatform::Wayland;
+  return WindowPlatform::Other;
+}
+
+bool finish_setup(WindowPlatform platform);
 
 // Probe the GL version from the version string, which is specified to begin
 // with "<major>.<minor>" regardless of profile or vendor.
@@ -224,6 +251,7 @@ constexpr ProcSlot kRenderProcs[] = {
     {&f.CullFace, sizeof(f.CullFace), "glCullFace"},
     {&f.FrontFace, sizeof(f.FrontFace), "glFrontFace"},
     {&f.ColorMask, sizeof(f.ColorMask), "glColorMask"},
+    {&f.ReadPixels, sizeof(f.ReadPixels), "glReadPixels"},
 };
 
 template <size_t N>
@@ -258,6 +286,125 @@ bool make_current() {
   return eglMakeCurrent(g_display, g_surface, g_surface, g_context) == EGL_TRUE;
 }
 
+WindowPlatform window_platform() { return g_platform; }
+
+// ---------------------------------------------------------------------------
+// M3: window surfaces
+// ---------------------------------------------------------------------------
+
+WindowSurface create_window_surface(uint64_t native_window) {
+  if (g_display == EGL_NO_DISPLAY || g_config == nullptr ||
+      g_context == EGL_NO_CONTEXT) {
+    KNIZ_ERR("cannot create a window surface: there is no OpenGL context");
+    return nullptr;
+  }
+  if (g_platform != WindowPlatform::X11) {
+    // The handle is an X11 XID and this display is something else.  Handing it
+    // to eglCreateWindowSurface would have EGL interpret it as a pointer to a
+    // Wayland surface or worse, so it is refused here with the reason.
+    KNIZ_ERR("cannot create an X11 window surface: the OpenGL context is on the "
+             "%s platform, and a GL context cannot be moved to another window "
+             "system once its objects exist",
+             g_platform == WindowPlatform::Wayland   ? "Wayland"
+             : g_platform == WindowPlatform::None    ? "no"
+                                                     : "an unidentified");
+    return nullptr;
+  }
+  if (!g_window_capable) {
+    KNIZ_ERR("cannot create a window surface: this OpenGL context has no "
+             "display or config that supports windows%s",
+             g_surfaceless ? " (it is a surfaceless context)" : "");
+    return nullptr;
+  }
+
+  // The native handle is an X11 XID, which is what EGL wants for an X11
+  // window.  The connection is EGL's own: XIDs are server-wide, so a window
+  // created on the application's connection is still a window EGL can draw to.
+  const EGLNativeWindowType window =
+      static_cast<EGLNativeWindowType>(native_window);
+  const EGLint attribs[] = {EGL_NONE};
+  EGLSurface surface = eglCreateWindowSurface(g_display, g_config, window, attribs);
+  if (surface == EGL_NO_SURFACE) {
+    KNIZ_ERR("eglCreateWindowSurface failed (0x%04x)", eglGetError());
+    return nullptr;
+  }
+
+  // The swap interval is the whole of what FIFO means here: the presentation
+  // queue is the compositor's, and an interval of 1 is what makes eglSwapBuffers
+  // wait for it.  EGL's default is already 1, but the one present mode this
+  // driver offers should not depend on a default being remembered, and the
+  // interval can only be set while the surface is current.
+  WindowSurface handle = reinterpret_cast<WindowSurface>(surface);
+  if (bind_window_surface(handle)) {
+    eglSwapInterval(g_display, 1);
+    bind_headless_surface();
+  }
+
+  KNIZ_DBG("window surface created for native window 0x%llx",
+           static_cast<unsigned long long>(native_window));
+  return handle;
+}
+
+void destroy_window_surface(WindowSurface surface) {
+  if (surface == nullptr || g_display == EGL_NO_DISPLAY)
+    return;
+  EGLSurface egl_surface = reinterpret_cast<EGLSurface>(surface);
+  // A surface that is still current on some thread cannot be destroyed, and the
+  // thread that created it may not be this one.  Making it not-current on the
+  // calling thread is all that can be done from here.  The headless drawable is
+  // then made current again: the context has to keep somewhere to draw, and every
+  // GL call after this one assumes it has.
+  eglMakeCurrent(g_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  eglDestroySurface(g_display, egl_surface);
+  bind_headless_surface();
+}
+
+bool bind_window_surface(WindowSurface surface) {
+  if (surface == nullptr || g_display == EGL_NO_DISPLAY ||
+      g_context == EGL_NO_CONTEXT)
+    return false;
+  EGLSurface egl_surface = reinterpret_cast<EGLSurface>(surface);
+  if (eglMakeCurrent(g_display, egl_surface, egl_surface, g_context) != EGL_TRUE) {
+    KNIZ_ERR("could not make the window surface current (0x%04x)", eglGetError());
+    return false;
+  }
+  return true;
+}
+
+bool bind_headless_surface() {
+  if (g_display == EGL_NO_DISPLAY || g_context == EGL_NO_CONTEXT)
+    return false;
+  return eglMakeCurrent(g_display, g_surface, g_surface, g_context) == EGL_TRUE;
+}
+
+bool window_surface_size(WindowSurface surface, int* width, int* height) {
+  if (surface == nullptr || g_display == EGL_NO_DISPLAY || width == nullptr ||
+      height == nullptr)
+    return false;
+  EGLint w = 0;
+  EGLint h = 0;
+  EGLSurface egl_surface = reinterpret_cast<EGLSurface>(surface);
+  if (eglQuerySurface(g_display, egl_surface, EGL_WIDTH, &w) != EGL_TRUE ||
+      eglQuerySurface(g_display, egl_surface, EGL_HEIGHT, &h) != EGL_TRUE) {
+    KNIZ_ERR("could not query the window surface size (0x%04x)", eglGetError());
+    return false;
+  }
+  *width = w;
+  *height = h;
+  return true;
+}
+
+bool swap_window_surface(WindowSurface surface) {
+  if (surface == nullptr || g_display == EGL_NO_DISPLAY)
+    return false;
+  EGLSurface egl_surface = reinterpret_cast<EGLSurface>(surface);
+  if (eglSwapBuffers(g_display, egl_surface) != EGL_TRUE) {
+    KNIZ_ERR("eglSwapBuffers failed (0x%04x)", eglGetError());
+    return false;
+  }
+  return true;
+}
+
 bool create_headless() {
   if (g_attempted)
     return g_ok;
@@ -265,18 +412,46 @@ bool create_headless() {
 
   // Two ways to get a context with no window, tried in order.
   //
-  //   1. The default display with a pbuffer.  This is what an ordinary desktop
-  //      session gives us, and it is the better option when it works because it
-  //      goes through the vendor's normal platform path.
-  //   2. The surfaceless platform.  This is the one that works in containers,
-  //      CI runners and any other place with no X11 or Wayland display, and it
-  //      is why the backend does not simply require EGL_DEFAULT_DISPLAY to
-  //      succeed.
+  //   1. The X11 platform, when DISPLAY is set.  This is what an ordinary
+  //      desktop session gives us, and it is the only platform presentation
+  //      works on so far.
+  //   2. The default display with a pbuffer.  Whatever platform the
+  //      implementation prefers, used for drawing when X11 was not available.
+  //   3. The surfaceless platform.  This is the one that works in containers,
+  //      CI runners and any other place with no display at all, and it is why
+  //      the backend does not simply require a display to succeed.
   //
-  // Both are headless: no window is created and nothing is ever presented.  M3
-  // adds the third path, a real surface for the swapchain.
+  // The context is headless in all three cases: it draws to a pbuffer or to
+  // nothing, and a window is only ever made current on it at present time
+  // (§3.13).
+  //
+  // The platform is chosen explicitly rather than left to Mesa's preference,
+  // which is derived from the environment: with both WAYLAND_DISPLAY and
+  // DISPLAY set -- the normal shape of a Wayland desktop running XWayland -- it
+  // picks Wayland, and then an X11 window handle cannot be presented to at all.
+  // X11 is asked for first because it is the platform presentation currently
+  // supports, and it is reachable on both an X11 desktop and a Wayland one.
+  // Wayland is the next milestone's platform, and its absence is reported
+  // rather than worked around.
+#if defined(EGL_PLATFORM_X11_KHR)
+  if (std::getenv("DISPLAY") != nullptr &&
+      has_client_extension("EGL_EXT_platform_x11")) {
+    EGLDisplay display = eglGetPlatformDisplay(
+        EGL_PLATFORM_X11_KHR, EGL_DEFAULT_DISPLAY, nullptr);
+    if (bring_up(display, true, "X11 platform")) {
+      if (finish_setup(WindowPlatform::X11))
+        return true;
+      KNIZ_ERR("OpenGL context came up but could not be used");
+      release();
+      return false;
+    }
+  }
+#endif
+
   if (bring_up(eglGetDisplay(EGL_DEFAULT_DISPLAY), true, "default display")) {
-    if (finish_setup())
+    // EGL_DEFAULT_DISPLAY leaves the choice to the implementation, so the
+    // platform is identified afterwards rather than assumed.
+    if (finish_setup(WindowPlatform::Other))
       return true;
     KNIZ_ERR("OpenGL context came up but could not be used");
     release();
@@ -288,7 +463,7 @@ bool create_headless() {
   if (bring_up(eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA,
                                      EGL_DEFAULT_DISPLAY, nullptr),
                false, "surfaceless platform")) {
-    if (finish_setup())
+    if (finish_setup(WindowPlatform::None))
       return true;
     KNIZ_ERR("OpenGL context came up but could not be used");
     release();
@@ -333,10 +508,17 @@ bool bring_up(EGLDisplay display, bool wants_surface, const char* label) {
   // a count of zero, so there is nothing in the error code to go on.  Requesting
   // pbuffer-capable configs works on both display kinds; only actual surface
   // creation differs between them.
+  //
+  // The surface type asks for window surfaces as well when there is a display
+  // that might have them, because a swapchain needs the same config the context
+  // was created with -- EGL will not make a context current with a drawable from
+  // a different config.  A surfaceless display matches no such config at all, so
+  // that attempt is allowed to fail and the pbuffer-only request follows it.
   EGLint config_attribs[16];
   int n = 0;
   config_attribs[n++] = EGL_SURFACE_TYPE;
-  config_attribs[n++] = EGL_PBUFFER_BIT;
+  config_attribs[n++] =
+      wants_surface ? (EGL_PBUFFER_BIT | EGL_WINDOW_BIT) : EGL_PBUFFER_BIT;
   config_attribs[n++] = EGL_RENDERABLE_TYPE;
   config_attribs[n++] = EGL_OPENGL_BIT;
   config_attribs[n++] = EGL_RED_SIZE;
@@ -351,13 +533,33 @@ bool bring_up(EGLDisplay display, bool wants_surface, const char* label) {
 
   EGLConfig config = nullptr;
   EGLint num_configs = 0;
-  if (eglChooseConfig(display, config_attribs, &config, 1, &num_configs) !=
-          EGL_TRUE ||
-      num_configs < 1) {
+  bool chose =
+      eglChooseConfig(display, config_attribs, &config, 1, &num_configs) ==
+          EGL_TRUE &&
+      num_configs >= 1;
+  if (!chose && wants_surface) {
+    KNIZ_DBG("%s: no config supports window surfaces, asking for a pbuffer only",
+             label);
+    config_attribs[1] = EGL_PBUFFER_BIT;
+    chose = eglChooseConfig(display, config_attribs, &config, 1, &num_configs) ==
+                EGL_TRUE &&
+            num_configs >= 1;
+  }
+  if (!chose) {
     KNIZ_DBG("%s: no matching EGL config (0x%04x)", label, eglGetError());
     eglTerminate(display);
     return false;
   }
+
+  // Whether this config can back a window.  Recorded rather than assumed: a
+  // pbuffer-only config works for everything except presentation, and knowing
+  // which one we got is what lets a swapchain be refused with a reason instead
+  // of failing at eglCreateWindowSurface later.
+  EGLint surface_type = 0;
+  const bool window_capable =
+      eglGetConfigAttrib(display, config, EGL_SURFACE_TYPE, &surface_type) ==
+          EGL_TRUE &&
+      (surface_type & EGL_WINDOW_BIT) != 0;
 
   EGLSurface surface = EGL_NO_SURFACE;
   if (wants_surface) {
@@ -411,6 +613,7 @@ bool bring_up(EGLDisplay display, bool wants_surface, const char* label) {
       g_surface = surface;
       g_context = context;
       g_surfaceless = !wants_surface;
+      g_window_capable = window_capable;
       g_info.core = c.core;
 
       KNIZ_DBG("OpenGL %d.%d %s context via %s (EGL %d.%d)", c.major, c.minor,
@@ -443,6 +646,8 @@ void release() {
   g_surface = EGL_NO_SURFACE;
   g_context = EGL_NO_CONTEXT;
   g_surfaceless = false;
+  g_window_capable = false;
+  g_platform = WindowPlatform::None;
 }
 
 }  // namespace
@@ -459,7 +664,11 @@ namespace {
 
 // Fills in the entry point table and the context description once a context is
 // current.  Kept separate from bring_up so both display paths share it.
-bool finish_setup() {
+bool finish_setup(WindowPlatform platform) {
+  g_platform = platform == WindowPlatform::Other
+                   ? platform_of_display(g_display)
+                   : platform;
+
   if (!load_proc(&f.GetString, sizeof(f.GetString), "glGetString") ||
       !load_proc(&f.GetIntegerv, sizeof(f.GetIntegerv), "glGetIntegerv") ||
       !load_proc(&f.GetError, sizeof(f.GetError), "glGetError"))
@@ -598,10 +807,27 @@ bool finish_setup() {
   if (g_info.sampler_capable)
     KNIZ_INFO("samplers available: sampler objects, %d texture unit(s)",
               g_info.max_texture_units);
+
   else
     KNIZ_INFO("samplers are unavailable: sampler objects need OpenGL 3.3 and "
               "this is a %d.%d context",
               g_info.major, g_info.minor);
+
+  // A window surface needs both a config that supports windows and a display
+  // whose platform the surface handle belongs to.
+  g_info.window_capable = g_window_capable && g_info.render_capable &&
+                          g_platform == WindowPlatform::X11;
+  if (g_info.window_capable)
+    KNIZ_INFO("presentation available: X11 windows, through EGL on the X11 "
+              "platform");
+  else
+    KNIZ_INFO("presentation is unavailable: %s",
+              g_platform == WindowPlatform::Wayland
+                  ? "the context is on Wayland, and Wayland surfaces are the "
+                    "next milestone"
+                  : g_platform == WindowPlatform::None
+                        ? "there is no window system (a surfaceless context)"
+                        : "this EGL display cannot create a window surface");
   if (g_info.render_capable)
     KNIZ_INFO("rendering available: framebuffer objects, vertex array objects, "
               "draws");

@@ -10,6 +10,7 @@
 #include "kniz_gl.h"
 #include "kniz_image.h"
 #include "kniz_objects.h"
+#include "kniz_swapchain.h"
 
 #include <atomic>
 #include <cstdio>
@@ -244,15 +245,46 @@ VKAPI_ATTR VkResult VKAPI_CALL EnumerateInstanceVersion(uint32_t* pApiVersion) {
   return VK_SUCCESS;
 }
 
+// The instance extensions Kniz implements.  VK_KHR_surface is the abstract
+// half -- a surface, its capabilities, its formats -- and VK_KHR_xcb_surface is
+// the platform half that turns an X11 window into one.  Both are needed for
+// anything that presents; without them the loader refuses to create an instance
+// for an application that enables them, which is the honest failure.
+//
+// Wayland and Xlib surfaces are not listed.  Both are a real change rather than
+// an alias: a GL context lives on one EGL display, so a Wayland surface needs the
+// context to have come up on Wayland and needs a wl_egl_window wrapped around the
+// application's wl_surface, which is the next milestone (see DESIGN.md §3.13).
+// Until then vkGetPhysicalDeviceSurfaceSupportKHR reports no support when the
+// context is not on X11, which is what an application should be checking.
+constexpr VkExtensionProperties kInstanceExtensions[] = {
+    {"VK_KHR_surface", VK_KHR_SURFACE_SPEC_VERSION},
+    {"VK_KHR_xcb_surface", kXcbSurfaceSpecVersion},
+};
+
+constexpr bool instance_extension_supported(const char* name) {
+  for (const VkExtensionProperties& extension : kInstanceExtensions) {
+    if (std::strcmp(extension.extensionName, name) == 0)
+      return true;
+  }
+  return false;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL EnumerateInstanceExtensionProperties(
     const char* pLayerName, uint32_t* pPropertyCount,
     VkExtensionProperties* pProperties) {
   (void)pLayerName;
   if (pPropertyCount == nullptr)
     return VK_ERROR_INITIALIZATION_FAILED;
-  // No instance extensions yet.  VK_KHR_surface and the platform surface
-  // extensions arrive with the swapchain in M3.
-  return enumerate_count(0, pPropertyCount, pProperties);
+
+  constexpr uint32_t kCount =
+      sizeof(kInstanceExtensions) / sizeof(kInstanceExtensions[0]);
+  const VkResult result = enumerate_count(kCount, pPropertyCount, pProperties);
+  if (result == VK_SUCCESS && pProperties != nullptr) {
+    for (uint32_t i = 0; i < kCount; ++i)
+      pProperties[i] = kInstanceExtensions[i];
+  }
+  return result;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL CreateInstance(
@@ -279,8 +311,10 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateInstance(
   }
 
   for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; ++i) {
-    KNIZ_WARN("instance extension '%s' requested but not implemented",
-              pCreateInfo->ppEnabledExtensionNames[i]);
+    const char* name = pCreateInfo->ppEnabledExtensionNames[i];
+    if (!instance_extension_supported(name)) {
+      KNIZ_WARN("instance extension '%s' requested but not implemented", name);
+    }
   }
 
   Instance* instance = nullptr;
@@ -430,8 +464,21 @@ VKAPI_ATTR VkResult VKAPI_CALL EnumerateDeviceExtensionProperties(
   (void)pLayerName;
   if (pPropertyCount == nullptr)
     return VK_ERROR_INITIALIZATION_FAILED;
-  // No device extensions yet.  VK_KHR_swapchain is the first that matters.
-  return enumerate_count(0, pPropertyCount, pProperties);
+
+  // One device extension.  VK_KHR_swapchain is what turns a surface into
+  // something an application can draw into and show; it is advertised here and
+  // accepted in vkCreateDevice, and everything else is still warned about.
+  constexpr VkExtensionProperties kDeviceExtensions[] = {
+      {"VK_KHR_swapchain", VK_KHR_SWAPCHAIN_SPEC_VERSION},
+  };
+  constexpr uint32_t kCount =
+      sizeof(kDeviceExtensions) / sizeof(kDeviceExtensions[0]);
+  const VkResult result = enumerate_count(kCount, pPropertyCount, pProperties);
+  if (result == VK_SUCCESS && pProperties != nullptr) {
+    for (uint32_t i = 0; i < kCount; ++i)
+      pProperties[i] = kDeviceExtensions[i];
+  }
+  return result;
 }
 
 VKAPI_ATTR void VKAPI_CALL GetPhysicalDeviceFormatProperties(
@@ -548,6 +595,19 @@ const Entry kEntries[] = {
      as_entry(GetPhysicalDeviceImageFormatProperties)},
     {"vkGetPhysicalDeviceSparseImageFormatProperties",
      as_entry(GetPhysicalDeviceSparseImageFormatProperties)},
+
+    // Surfaces and their queries.  The platform half is xcb, whose create info
+    // is declared in kniz_swapchain.h rather than by including an xcb header.
+    {"vkCreateXcbSurfaceKHR", as_entry(CreateXcbSurfaceKHR)},
+    {"vkDestroySurfaceKHR", as_entry(DestroySurfaceKHR)},
+    {"vkGetPhysicalDeviceSurfaceSupportKHR",
+     as_entry(GetPhysicalDeviceSurfaceSupportKHR)},
+    {"vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
+     as_entry(GetPhysicalDeviceSurfaceCapabilitiesKHR)},
+    {"vkGetPhysicalDeviceSurfaceFormatsKHR",
+     as_entry(GetPhysicalDeviceSurfaceFormatsKHR)},
+    {"vkGetPhysicalDeviceSurfacePresentModesKHR",
+     as_entry(GetPhysicalDeviceSurfacePresentModesKHR)},
 
     // vkGetInstanceProcAddr is the one entry point that has to be in this
     // table: it is how anything else is found in the first place.

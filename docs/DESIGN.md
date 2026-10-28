@@ -41,6 +41,9 @@ work we can do; anything in the "Lost" column is unfixable.
 | Clip space depth | `gl_Position.z = 2z - w`, injected by SPIRV-Cross | Good — needed because Vulkan's depth range is `[0, w]` and GL's is `[-w, w]`; see §4, M2b |
 | `VkImage` + `vkMapMemory` | GL texture, no host mirror | **Partial** — every read and write goes through a command; `LINEAR` tiling and mapping an image's allocation are refused outright (see §4, M2a) |
 | `VkImage` layout + barriers | none; implicit | Mostly harmless; emit `glMemoryBarrier` where coherence matters |
+| `VkSurfaceKHR`, `VkSwapchainKHR` | an EGL window surface plus a list of GL textures | **Emulated** — GL cannot make a texture a window's front buffer, so presentation is a draw from one to the other (§3.13) |
+| `vkQueuePresentKHR` | a textured full-screen triangle, then `eglSwapBuffers` | Good for one format and FIFO; synchronous, so there is no queue to drop or skip |
+| Surfaces on a second window system | `wl_egl_window` for Wayland | Expressible, not implemented — a GL context lives on one EGL display, so the platform is fixed when the context is created (§3.13) |
 | Fences, binary semaphores, events | `GLSync` / synchronous replay | Approximate |
 | Timeline semaphores | none | **Lost** — needs an emulation layer |
 | `VkDeviceMemory` heaps, types, `vkMapMemory` | none | **Faked** — shadow object + lazy GL allocation |
@@ -289,12 +292,14 @@ don't know the shape.
 
 ### 3.8 WSI
 
-Late, deliberately. In ICD mode *we* implement `vkCreateXlibSurfaceKHR`, so we
-receive the app's `Display` and `Window`; then `glXCreateWindow` + a GL context
-bound to that surface, and present via `glXSwapBuffers`. Wayland needs the EGL
-path. Deferred until render passes and pipelines were known good, so we were
-never debugging WSI and drawing at the same time — M2b is now done, so this is
-next but one.
+Late, deliberately: deferred until render passes and pipelines were known good, so
+that WSI and drawing were never being debugged at the same time. The original
+plan was GLX — take the app's `Display` and `Window` and swap buffers on them —
+which would have needed a second GL context on the window and a share group to
+reach the objects the headless context owns. EGL gives the same context a window
+drawable instead, which needs no sharing and no second context, so that is the
+path that was taken. Implemented in M3; see §3.13 for what it actually does and
+what it refuses.
 
 ### 3.9 Build portability
 
@@ -518,6 +523,101 @@ approximations:
   sampler creation. Anisotropic filtering is refused for the same reason: the
   extension is not resolved and the feature is not reported.
 
+### 3.13 Windows, surfaces and swapchains
+
+A Vulkan swapchain is a queue of images the presentation engine will show. GL has
+no such object: a window's back buffer belongs to the window system, and a
+texture is never that buffer. So a Kniz swapchain is two things joined at present
+time — a list of ordinary GL textures and an EGL window surface — and
+`vkQueuePresentKHR` is a draw from one into the other followed by
+`eglSwapBuffers`.
+
+**The platform is chosen, not inherited.** A GL context lives on exactly one EGL
+display and its textures cannot be moved to another, so the window system Kniz
+can present on is decided once, when the context is created. Leaving that to
+`eglGetDisplay(EGL_DEFAULT_DISPLAY)` is wrong on the most common desktop shape
+there is: with both `WAYLAND_DISPLAY` and `DISPLAY` set — a Wayland session
+running XWayland — Mesa picks Wayland, and an X11 window handle then means
+nothing to it. The first version of this code did exactly that, and the result
+was not an error but a segmentation fault inside `eglCreateWindowSurface`: EGL
+read the XID as a pointer to a Wayland surface. So `kniz_gl.cpp` now asks for
+`EGL_PLATFORM_X11_KHR` explicitly when `DISPLAY` is set and the platform is
+advertised, falls back to `EGL_DEFAULT_DISPLAY` with the platform identified
+afterwards, and finally to the surfaceless platform. Wayland surfaces are the
+next milestone; until then a context that came up on Wayland reports presentation
+as unavailable rather than accepting a handle it cannot use.
+
+**A surface owns the drawable; a swapchain owns the images.** The EGL window
+surface is created the first time a swapchain needs it and lives in `Surface`,
+because it belongs to the window rather than to the images: an application that
+resizes destroys its swapchain and creates another on the same surface, and a
+second EGL surface for one window is neither necessary nor reliably possible —
+Mesa answers the second one with `EGL_BAD_ALLOC`. The images are textures with no
+`VkDeviceMemory` behind them, which is what `vkGetSwapchainImagesKHR` handing out
+handles rather than objects implies: the application never allocates or binds
+memory for them, and `vkDestroyImage` on one is invalid usage, so they are
+created and destroyed with the swapchain and appear in no device list. A render
+pass that draws into one therefore needs nothing M2b did not already provide.
+
+**Presentation is a draw, not a blit.** `glBlitFramebuffer` would be shorter, but
+it requires the source and destination to have compatible formats, and the
+window's format is the window system's to choose. A blit would therefore either
+refuse configurations that work or swap channels silently — the exact failure
+class this project refuses. A textured triangle covering the viewport lets GL
+convert on the way out the way it does for every other draw, so the swapchain
+format and the window's format need not agree. The triangle is generated from
+`gl_VertexID`, so there is no vertex buffer and no attribute to bind.
+
+**The one y flip.** GL's window coordinates count up from the bottom, so texture
+row 0 is the *bottom* row of the window, while in Kniz row 0 is Vulkan's *top*
+row (§4, M2b). Every other path in this driver draws without flipping, and this
+is the single place that flips — in the present fragment shader, as
+`1.0 - texcoord.y` — because the window is the only surface whose row order is
+the window system's rather than Vulkan's. The M3 test is built so that getting
+this wrong cannot pass: the triangle's flat edge and its apex are at opposite
+ends of the image.
+
+**Sizes and scaling.** `currentExtent` is reported as `0xFFFFFFFF`, Vulkan's "you
+decide", because the window's size is the window system's to decide and asking
+would mean a round trip on a connection Kniz deliberately does not hold.
+Presentation draws to the window's current size, whatever that is, through a
+linear sampler — which is what makes a window manager resizing the window work at
+all. On the development machine Hyprland tiled the test's window from 320x240 to
+655x674, and presentation scaled to it without any code knowing the window had
+changed.
+
+**Refused rather than approximated:** any swapchain format but
+`R8G8B8A8_UNORM`; any colour space but `SRGB_NONLINEAR` (an sRGB swapchain needs
+the encoding applied by hand to a linear window, and getting that wrong is a
+colour that looks almost right); any present mode but FIFO (presentation is
+synchronous, so there is no queue to drop or skip); `imageArrayLayers != 1`; any
+usage beyond colour attachment and transfer source; any pre-transform but
+identity; any composite alpha but opaque; and fewer than two images.
+
+**Synchronisation** follows the rest of the driver. Presentation is synchronous,
+so by the time `vkQueuePresentKHR` returns the frame is on its way to the screen
+and the next acquire can hand out the next image unconditionally. Acquisition is
+round robin; the fence it is given is signalled immediately and the semaphore is
+ignored, exactly as submission does (§4, M1).
+
+**`KNIZ_PRESENT_DUMP`.** Presentation is the one result that is normally only
+visible to a person, so the driver can be asked to write the frame it is about to
+swap to a file as a binary PPM. That is the same buffer `eglSwapBuffers` is
+handed, which lets a test compare the presented frame against the image it drew,
+pixel for pixel and orientation included, instead of needing a screenshot and an
+eye. It costs nothing when unset: the environment is read per present and the
+readback path is skipped.
+
+**Costs, recorded rather than discovered later:** the present is a full-screen
+draw with a program switch, a VAO bind, a texture bind and a sampler bind per
+frame — small, but it is per frame and on the thread that submits;
+`eglSwapBuffers` blocks when the compositor is behind, which is the FIFO
+behaviour that was asked for and also a stall in the calling thread; recreating a
+swapchain recreates its images from scratch, because nothing is shared between an
+old swapchain and its replacement; and because the drawable belongs to the
+surface, a destroyed window keeps its drawable until the surface is destroyed,
+which Vulkan requires the application to do anyway.
+
 ## 4. Milestones
 
 | | Goal | Proves | Gate |
@@ -528,7 +628,8 @@ approximations:
 | **M2b** ✅ | Offscreen graphics: render pass → FBO, pipeline → program, draws → image | Passes, pipelines, state, and the coordinate conventions a silently wrong lowering gets wrong | image matches a CPU rasterisation |
 | **M2c** ✅ | Uniform buffers and push constants | The descriptor and binding paths, extended from storage buffers to uniforms, and a construct GL has no equivalent for at all | numeric test passes |
 | **M2d** ✅ | Samplers and textures | GL's sampler state lives on the texture where Vulkan's lives on a sampler object | numeric test passes |
-| **M3** | GLX/EGL swapchain | WSI | `vkcube` on screen |
+| **M3a** ✅ | Swapchain and presentation on an X11 window | WSI: surfaces, images the driver owns, and the one legitimate flip | presented frame matches the image |
+| **M3b** | Depth and stencil attachments | The pipeline state `vkcube` needs before it will draw | `vkcube` on screen |
 | **M4** | Fences, events, timestamps, queries | Correctness | sample suite runs |
 
 M0 is done and was checked on the development machine (Intel HD 4400 / Mesa
@@ -819,6 +920,61 @@ not on the hot path; and the mip-level refusal above means an application that
 allocates a full mip chain for a texture it only ever samples at level 0 is turned
 away, which is a large class of applications. That last one is the first thing the
 transfer path should fix.
+
+M3a is done: its test (`tests/present.cpp`) creates an X11 window, builds a
+surface on it, creates a swapchain, draws into one of the images it was given, and
+presents it. It is the first milestone whose result is not an image the test holds
+but pixels on a screen, which changes what a gate has to do.
+
+- **What the application controls is checked as before.** The swapchain images are
+  ordinary textures, so drawing into one and copying it back proves the render
+  pass, the pipeline and the attachment agree. The triangle is the M2b one,
+  compared against a CPU rasterisation of the same vertex data.
+
+- **The last step is checked by asking the driver to show its work.** The frame
+  that is about to be swapped is written to a PPM (`KNIZ_PRESENT_DUMP`), and that
+  file is compared against the same reference. A screenshot would prove the same
+  thing less precisely and would need a person to look at it. Because the triangle
+  is asymmetric about the horizontal axis, a flip anywhere in the present path
+  moves the apex to the top row and fails the comparison.
+
+- **The window is deliberately not mapped.** A mapped window is resized by the
+  window manager — Hyprland tiled this one from 320x240 to 655x674 — and the frame
+  is then a scaled version of the image, which cannot be compared pixel for pixel.
+  An unmapped window keeps the geometry the test asked for, and the present path
+  (draw, read back, swap) is identical; only the compositor's copy is missing. The
+  mapped case was checked by hand, which is where the 655x674 observation came
+  from.
+
+- **Scaling is checked with a second swapchain** half the window's size, cleared
+  to a single colour: every pixel of the presented frame must be that colour, so a
+  present that drew at the image's size instead of the window's leaves three
+  quarters of the window untouched.
+
+- **The refusals are asserted**, in the style of M2b and M2d: a B8G8R8A8 format, a
+  display-P3 colour space, one image, MAILBOX, a storage usage, a rotated
+  pre-transform and pre-multiplied alpha are each required to fail, and presenting
+  an index the swapchain does not have is required to fail rather than to draw.
+
+Two mutations confirmed that the gate is a gate. Removing the flip from the
+present shader moves the triangle's apex to the top of the window, and 56,964
+pixels disagree with the reference. Setting the present viewport to the
+swapchain's extent instead of the window's leaves 57,600 of 76,800 pixels
+untouched — exactly the three quarters that a 160x120 image does not cover of a
+320x240 window, which is the count the scaling check exists to make. Both were
+reverted.
+
+A third mutation was tried and is worth recording as a limit rather than a
+success: removing the `glBindSampler` call from the present leaves the test
+passing, because the test never leaves a mipmap-filtering sampler bound to unit 0
+and the swapchain image's own state happens to be benign. The sampler object is
+kept anyway, since it is what makes the present independent of whatever sampler
+the application last bound to unit 0 — but this gate does not prove it, and saying
+so is more useful than implying otherwise.
+
+M3a's remaining costs are in §3.13. What it leaves undone is what `vkcube`
+needs next: a depth attachment, depth test and depth write, which M2b refuses, and
+which is why M3b exists as a separate milestone rather than being folded in here.
 
 ## 5. Non-goals
 

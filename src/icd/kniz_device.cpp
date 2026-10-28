@@ -15,6 +15,7 @@
 #include "kniz_device.h"
 #include "kniz_entrypoints.h"
 #include "kniz_objects.h"
+#include "kniz_swapchain.h"
 
 #include <new>
 
@@ -128,6 +129,13 @@ const Entry kEntries[] = {
     {"vkCmdDrawIndexed", as_entry(CmdDrawIndexed)},
     {"vkCmdClearAttachments", as_entry(CmdClearAttachments)},
 
+    // Presentation.
+    {"vkCreateSwapchainKHR", as_entry(CreateSwapchainKHR)},
+    {"vkDestroySwapchainKHR", as_entry(DestroySwapchainKHR)},
+    {"vkGetSwapchainImagesKHR", as_entry(GetSwapchainImagesKHR)},
+    {"vkAcquireNextImageKHR", as_entry(AcquireNextImageKHR)},
+    {"vkQueuePresentKHR", as_entry(QueuePresentKHR)},
+
     // Submission and synchronisation.
     {"vkQueueSubmit", as_entry(QueueSubmit)},
     {"vkCreateFence", as_entry(CreateFence)},
@@ -173,8 +181,10 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(
   }
 
   for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; ++i) {
-    KNIZ_WARN("device extension '%s' requested but not implemented",
-              pCreateInfo->ppEnabledExtensionNames[i]);
+    const char* name = pCreateInfo->ppEnabledExtensionNames[i];
+    if (!swapchain_extension_supported(name)) {
+      KNIZ_WARN("device extension '%s' requested but not implemented", name);
+    }
   }
 
   if (pCreateInfo->pEnabledFeatures != nullptr) {

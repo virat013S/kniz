@@ -48,6 +48,14 @@ add_executable(kniz_sampler sampler.cpp)
 target_link_libraries(kniz_sampler PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
 target_compile_options(kniz_sampler PRIVATE -Wall -Wextra)
 
+# The M3 milestone test: presentation.  It needs a window, which it makes itself
+# through libX11 opened with dlopen -- so the build gains no X11 dependency, and a
+# machine with no display skips the test rather than failing it.
+add_executable(kniz_present present.cpp)
+
+target_link_libraries(kniz_present PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+target_compile_options(kniz_present PRIVATE -Wall -Wextra)
+
 if(KNIZ_WERROR)
   target_compile_options(kniz_lifecycle PRIVATE -Werror)
   target_compile_options(kniz_compute PRIVATE -Werror)
@@ -55,6 +63,7 @@ if(KNIZ_WERROR)
   target_compile_options(kniz_draw PRIVATE -Werror)
   target_compile_options(kniz_uniform PRIVATE -Werror)
   target_compile_options(kniz_sampler PRIVATE -Werror)
+  target_compile_options(kniz_present PRIVATE -Werror)
 endif()
 
 add_test(NAME lifecycle COMMAND kniz_lifecycle)
@@ -67,6 +76,8 @@ add_test(NAME uniform
   COMMAND kniz_uniform "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
 add_test(NAME sampler
   COMMAND kniz_sampler "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
+add_test(NAME present
+  COMMAND kniz_present "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
 
 # The loader resolves the manifest's library_path relative to the manifest's own
 # directory, so build/src is where both the library and its manifest live:

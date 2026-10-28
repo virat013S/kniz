@@ -84,6 +84,12 @@ struct ContextInfo {
   // GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, which bounds the texture-unit
   // namespace the same way GL_MAX_*_BUFFER_BINDINGS bounds the buffer ones.
   int max_texture_units = 0;
+
+  // Whether this context can present to a window: an EGL display that creates
+  // window surfaces and a config that supports them.  False on the surfaceless
+  // platform, which is the normal case in a container or a CI runner, and where
+  // a swapchain has to be refused rather than created and never shown.
+  bool window_capable = false;
 };
 
 // Create a headless GL context and make it current on the calling thread.
@@ -101,6 +107,60 @@ const ContextInfo& info();
 // calls this first, because GL state is per-thread and the application is free
 // to call Vulkan from any thread.  Returns false if there is no context.
 bool make_current();
+
+// ---------------------------------------------------------------------------
+// M3: presenting to a window
+//
+// A swapchain image is a GL texture like any other, so drawing into it needs
+// nothing new.  Getting it onto the screen does: GL cannot make a texture *be*
+// the window's front buffer, so presentation is a blit from the image to the
+// default framebuffer of an EGL window surface, followed by eglSwapBuffers.
+//
+// The window surface is created on the same EGL display and from the same
+// config as the context.  That is what lets one context draw to both: the GL
+// objects an application created stay valid, and only the drawable changes.
+// ---------------------------------------------------------------------------
+
+// An EGL window surface, opaque outside kniz_gl.cpp.
+using WindowSurface = void*;
+
+// The window system the GL context's EGL display belongs to.
+//
+// This matters because a GL context lives on exactly one EGL display, and its
+// objects cannot be moved to another: presenting to a window from a different
+// window system is not a matter of opening a second display but of rebuilding
+// every texture and buffer the application owns.  So the platform is decided
+// when the context is created, and a surface from any other platform is refused
+// rather than handed to EGL, which would treat the handle as something it is not
+// -- on Mesa, as a pointer.
+enum class WindowPlatform {
+  None,      // no display at all
+  X11,       // X11 or XWayland
+  Wayland,   // Wayland
+  Other,     // some other platform, or one that could not be identified
+};
+
+// Which platform the current context belongs to.  None before create_headless.
+WindowPlatform window_platform();
+
+// Create a window surface for a native window handle, which is an X11 XID on
+// every platform Kniz supports so far.  Returns nullptr on failure, having
+// logged why.
+WindowSurface create_window_surface(uint64_t native_window);
+
+void destroy_window_surface(WindowSurface surface);
+
+// Make the window surface current on this thread, and afterwards go back to the
+// headless one.  Between the two the default framebuffer is the window.
+bool bind_window_surface(WindowSurface surface);
+bool bind_headless_surface();
+
+// The drawable's size in pixels.  It is the window's, not the swapchain's: the
+// two can differ, and the blit scales.
+bool window_surface_size(WindowSurface surface, int* width, int* height);
+
+// eglSwapBuffers.
+bool swap_window_surface(WindowSurface surface);
 
 // ---------------------------------------------------------------------------
 // Entry point table
@@ -231,6 +291,17 @@ struct Functions {
   void (*FrontFace)(Enum mode) = nullptr;
   void (*ColorMask)(unsigned char red, unsigned char green, unsigned char blue,
                     unsigned char alpha) = nullptr;
+
+  // ---- M3: presentation ---------------------------------------------------
+  //
+  // The only GL operation presentation needs that drawing did not: a blit from
+  // the swapchain image's texture to the window's default framebuffer.  Core
+  // since 3.0, and it is the whole of vkQueuePresentKHR besides the swap.
+  // Used only by the KNIZ_PRESENT_DUMP debug path, which reads the frame that
+  // is about to be shown so that presentation can be tested without a person
+  // looking at a window.
+  void (*ReadPixels)(Int x, Int y, Size width, Size height, Enum format,
+                     Enum type, void* pixels) = nullptr;
 };
 
 extern Functions f;
@@ -378,6 +449,16 @@ inline constexpr Enum kInt = 0x1404;
 
 inline constexpr Enum kCullFace = 0x0B44;
 inline constexpr Enum kScissorTest = 0x0C11;
+// Enables that Vulkan spells as pipeline state and GL keeps in the context.
+// Presentation has to clear them explicitly, because the last pipeline an
+// application drew with may have left any of them on.
+inline constexpr Enum kDepthTest = 0x0B71;
+inline constexpr Enum kStencilTest = 0x0B90;
+inline constexpr Enum kBlend = 0x0BE2;
+// GL's own sRGB framebuffer encoding, off by default and never enabled by Kniz.
+// Presentation turns it off rather than trusting the default, because a swapchain
+// format that is not sRGB must not be encoded on the way out.
+inline constexpr Enum kFramebufferSrgb = 0x8DB9;
 // Dithering has no Vulkan counterpart, and it perturbs a clear value in the
 // least significant bit rather than writing it exactly.
 inline constexpr Enum kDither = 0x0BD0;

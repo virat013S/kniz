@@ -156,16 +156,27 @@ struct Runtime {
   PFN_vkDeviceWaitIdle device_wait_idle = nullptr;
 };
 
+// Extensions to enable at creation time.  Empty by default, which is what every
+// test before the present one wants: none of them needs an extension to do its
+// work, and asking for one that the driver does not advertise would make the
+// loader refuse the instance.
+struct Extensions {
+  std::vector<const char*> instance;
+  std::vector<const char*> device;
+};
+
 // Creates the instance, selects the Kniz device, and creates the device and
 // queue.  Returns false after reporting why; on failure the caller should call
 // tear_down, which copes with a partly initialised Runtime.
-bool bring_up(Runtime* runtime, const char* app_name);
+bool bring_up(Runtime* runtime, const char* app_name,
+              const Extensions& extensions = Extensions{});
 
 // Releases everything bring_up created that is still alive.  Waits for the device
 // first, because teardown in these tests happens right after a submission.
 void tear_down(Runtime* runtime);
 
-inline bool bring_up(Runtime* runtime, const char* app_name) {
+inline bool bring_up(Runtime* runtime, const char* app_name,
+                     const Extensions& extensions) {
   auto create_instance =
       instance_proc<PFN_vkCreateInstance>(nullptr, "vkCreateInstance");
   if (create_instance == nullptr) {
@@ -181,6 +192,10 @@ inline bool bring_up(Runtime* runtime, const char* app_name) {
   VkInstanceCreateInfo instance_info{};
   instance_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
   instance_info.pApplicationInfo = &app;
+  instance_info.enabledExtensionCount =
+      static_cast<uint32_t>(extensions.instance.size());
+  instance_info.ppEnabledExtensionNames =
+      extensions.instance.empty() ? nullptr : extensions.instance.data();
 
   if (create_instance(&instance_info, nullptr, &runtime->instance) != VK_SUCCESS) {
     std::fprintf(stderr, "vkCreateInstance failed\n");
@@ -251,6 +266,10 @@ inline bool bring_up(Runtime* runtime, const char* app_name) {
   device_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
   device_info.queueCreateInfoCount = 1;
   device_info.pQueueCreateInfos = &queue_info;
+  device_info.enabledExtensionCount =
+      static_cast<uint32_t>(extensions.device.size());
+  device_info.ppEnabledExtensionNames =
+      extensions.device.empty() ? nullptr : extensions.device.data();
 
   if (create_device(runtime->physical, &device_info, nullptr, &runtime->device) !=
       VK_SUCCESS) {

@@ -384,7 +384,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateRenderPass(
   }
   if (subpass.colorAttachmentCount == 0) {
     KNIZ_ERR("a subpass with no colour attachment has nothing to draw into, and "
-             "default framebuffer rendering arrives with the swapchain (M3)");
+             "rendering to the window's default framebuffer is not implemented");
     delete pass;
     return VK_ERROR_FEATURE_NOT_PRESENT;
   }

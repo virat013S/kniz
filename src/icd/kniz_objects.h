@@ -54,6 +54,9 @@ inline constexpr uint64_t kSamplerMagic = 0x4B4E495A534D504Cull;         // KNIZ
 inline constexpr uint64_t kRenderPassMagic = 0x4B4E495A52504C5Aull;     // KNIZRPLZ
 inline constexpr uint64_t kFramebufferMagic = 0x4B4E495A4652414Dull;     // KNIZFRAM
 
+inline constexpr uint64_t kSurfaceMagic = 0x4B4E495A53555246ull;         // KNIZSURF
+inline constexpr uint64_t kSwapchainMagic = 0x4B4E495A53574150ull;       // KNIZSWAP
+
 // The largest push constant block Kniz accepts, and what it reports as
 // maxPushConstantsSize.  Vulkan's own minimum for that limit is 128, so a
 // driver cannot advertise less; this is the floor, adopted rather than an
@@ -86,6 +89,8 @@ struct ImageView;
 struct Sampler;
 struct RenderPass;
 struct Framebuffer;
+struct Surface;
+struct Swapchain;
 
 // ---------------------------------------------------------------------------
 // Objects
@@ -824,6 +829,82 @@ struct Framebuffer {
 };
 
 // ---------------------------------------------------------------------------
+// M3 objects: presentation
+// ---------------------------------------------------------------------------
+
+// A surface is a window, not a drawing target.  It is created on the instance
+// and outlives no device; the swapchain built on it is what owns GL objects.
+//
+// The only thing Kniz needs from the window is its native handle, because the
+// drawable is an EGL window surface and EGL wants exactly that handle.  Nothing
+// is ever asked of the window system directly -- no geometry query, no event
+// loop -- which is why this file needs no platform headers and why a surface
+// can be created from a window the application has not mapped yet.
+struct Surface {
+  uint64_t magic = kSurfaceMagic;
+  Instance* instance = nullptr;
+
+  // An X11 XID, kept as an integer rather than as an xcb_window_t so that no
+  // platform header has to be included here.  Both VK_KHR_xcb_surface and
+  // VK_KHR_xlib_surface hand us this same number.
+  uint64_t native_window = 0;
+
+  // The EGL drawable for that window, created the first time a swapchain needs
+  // it and destroyed with the surface.
+  //
+  // It belongs here rather than to the swapchain because it is a property of the
+  // window, not of the images: an application that resizes its window destroys
+  // its swapchain and creates another on the same surface, and creating a second
+  // EGL surface for one window is neither necessary nor always possible.  A
+  // swapchain that replaced an old one therefore shares this drawable, which is
+  // exactly what "the window did not change" means.
+  gl::WindowSurface window = nullptr;
+};
+
+// A swapchain is a list of images, shown in the surface's window.
+//
+// The images are ordinary GL textures -- the same object M2a made for VkImage --
+// so a render pass that draws into a swapchain image needs nothing new.  What is
+// new is presentation: GL cannot make a texture *be* a window's front buffer, so
+// the last step is explicit -- a draw from the image into the window, followed by
+// eglSwapBuffers (see kniz_swapchain.cpp and DESIGN.md §3.13).
+//
+// The window itself is not here: it belongs to the Surface, because it is a
+// property of the window rather than of the images, and an application that
+// resizes destroys its swapchain and makes another on the same surface.
+//
+// The images are owned here rather than by the application.  vkGetSwapchainImagesKHR
+// hands out handles that are valid until the swapchain is destroyed, and
+// vkDestroyImage on one of them is invalid usage, so they are created and
+// destroyed with the swapchain and never appear in any device list.
+struct Swapchain {
+  uint64_t magic = kSwapchainMagic;
+  Device* device = nullptr;
+  Surface* surface = nullptr;
+
+  VkFormat format = VK_FORMAT_UNDEFINED;
+  VkExtent2D extent{};
+  VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
+
+  // Presentation is a draw: one triangle covering the window, sampling the
+  // image through a sampler object, compiled once when the swapchain is made.
+  // The alternative -- glBlitFramebuffer -- only works when the image and the
+  // window happen to have the same format, which is not a constraint Vulkan
+  // imposes and which a window manager is free to break.
+  gl::Uint present_program = 0;
+  gl::Uint present_array = 0;
+  gl::Uint present_sampler = 0;
+
+  std::vector<Image*> images;
+
+  // Acquisition is round robin.  Kniz presents synchronously, so no image is
+  // ever in flight: by the time vkQueuePresentKHR returns the frame has been
+  // drawn and handed to the compositor, and the next acquire can hand out the
+  // next image unconditionally.
+  uint32_t next_image = 0;
+};
+
+// ---------------------------------------------------------------------------
 // Handle conversions
 // ---------------------------------------------------------------------------
 
@@ -927,6 +1008,14 @@ inline Framebuffer* from_handle(VkFramebuffer handle) {
   return detail::to_object<Framebuffer>(kFramebufferMagic, handle);
 }
 
+inline Surface* from_handle(VkSurfaceKHR handle) {
+  return detail::to_object<Surface>(kSurfaceMagic, handle);
+}
+
+inline Swapchain* from_handle(VkSwapchainKHR handle) {
+  return detail::to_object<Swapchain>(kSwapchainMagic, handle);
+}
+
 // The inverse conversions are equally direct.
 inline VkInstance to_handle(Instance* object) {
   return reinterpret_cast<VkInstance>(object);
@@ -994,6 +1083,14 @@ inline VkRenderPass to_handle(RenderPass* object) {
 
 inline VkFramebuffer to_handle(Framebuffer* object) {
   return reinterpret_cast<VkFramebuffer>(object);
+}
+
+inline VkSurfaceKHR to_handle(Surface* object) {
+  return reinterpret_cast<VkSurfaceKHR>(object);
+}
+
+inline VkSwapchainKHR to_handle(Swapchain* object) {
+  return reinterpret_cast<VkSwapchainKHR>(object);
 }
 
 inline VkCommandPool to_handle(CommandPool* object) {
