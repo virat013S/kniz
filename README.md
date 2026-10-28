@@ -30,6 +30,17 @@ Two consequences worth stating plainly:
   the registry, threads and files; a Vulkan ICD implements a few hundred graphics
   entry points. There is no overlap to compete on.
 
+One question this raises, answered before it is asked again: *can I play DirectX
+games through Kniz?* On the machines that matter for DirectX gaming, the answer
+does not involve this project — DXVK plus a native Vulkan driver already plays
+them, and Kniz placed underneath it is pure overhead. Where Kniz is actually
+present, a D3D game reaches it only as DXVK's output, and modern DXVK demands a
+Vulkan 1.3 feature level while Kniz reports its device as 1.0.0; the layer exits
+during device creation rather than the game ever crashing inside it. So: native
+Vulkan games have a real path here (§6's tier); DirectX games do not — and the
+one narrow exception (light, old, D3D9-class content through an older DXVK, on a
+future milestone if one ever earns it) is written here rather than promised.
+
 The honest, reachable goal:
 
 > Run `vkcube`, the Khronos Vulkan samples, and simple Vulkan 1.x applications
