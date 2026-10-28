@@ -32,6 +32,10 @@ work we can do; anything in the "Lost" column is unfixable.
 | Descriptor sets, `VkDescriptorSetLayout` | flat GL binding points, rebound at draw | Partial — one flat namespace per resource class, and only the bindings the shaders read have to be bound (§3.5) |
 | Uniform buffers | `glBindBufferRange(GL_UNIFORM_BUFFER, …)` | Good — the layout and the shader rewrite share one table, so they cannot disagree |
 | Push constants | a driver-owned uniform buffer, uploaded as the commands replay | **Emulated** — exact for a block std140 can express, refused for one it cannot (§3.11) |
+| `VkSampler` | `glGenSamplers` / `glBindSampler` | Good — GL separates filter state from the image exactly as Vulkan does, which is what makes two samplers over one image possible |
+| Sampled images | `GL_TEXTURE_2D` bound to a texture unit | Partial — 2D, level 0, one layer; a separate image and sampler have no GLSL form and are combined when the shader is translated (§3.12) |
+| Comparison samplers, anisotropic filtering | `sampler2DShadow`, `ARB_texture_filter_anisotropic` | Expressible, not implemented — refused at sampler creation |
+| Sampling mip levels above 0 | the same texture, `GL_TEXTURE_MAX_LEVEL` | **Lost** until the transfer path covers mip levels, because only level 0 is ever written (§4, M2d) |
 | Descriptor indexing / non-uniform indexing | `ARB_bindless_texture` | **Lost** on drivers without bindless (check `iris`) |
 | SPIR-V | GLSL via SPIRV-Cross | **Lossy** — no GLSL form for 8/16-bit types, storage-image formats, some group ops |
 | Clip space depth | `gl_Position.z = 2z - w`, injected by SPIRV-Cross | Good — needed because Vulkan's depth range is `[0, w]` and GL's is `[-w, w]`; see §4, M2b |
@@ -183,7 +187,9 @@ current and walks it. Because replay is synchronous:
 
 Vulkan's set/binding namespace is flattened to GL binding indices, and the whole
 set is re-bound at every draw and dispatch (GL has no "bind descriptor set"), with
-`glBindBufferRange` on `GL_UNIFORM_BUFFER` or `GL_SHADER_STORAGE_BUFFER`.
+`glBindBufferRange` on `GL_UNIFORM_BUFFER` or `GL_SHADER_STORAGE_BUFFER` for
+buffers and `glActiveTexture` / `glBindTexture` / `glBindSampler` for the texture
+units an image or sampler descriptor owns.
 
 The flattening was M2c's main discovery, and three things about it are worth
 stating because the obvious implementation is wrong:
@@ -251,6 +257,11 @@ explicitly rather than left to their defaults:
   emitted as an ordinary `uniform` block and the driver uploads to it (§3.11). The
   option only changes how the block is *declared*; the binding point it is given is
   set by Kniz, as with every other resource.
+
+Sampled images get one extra step before anything is emitted: separate images and
+samplers have no GLSL form, so `build_combined_image_samplers()` pairs them up and
+the dummy sampler `texelFetch` needs is injected past the end of the layout's
+texture units. §3.12 is the argument for the units each of them is given.
 
 A buffer block is declared in the GLSL with an explicit layout, and `std140` is the
 only one that is always available — `std430` is not permitted for a uniform block,
@@ -447,6 +458,66 @@ push constant block of plain vectors, which is what most applications write, is
 expressed exactly; one that needs the tight packing is refused rather than uploaded
 with its members read from the wrong place.
 
+### 3.12 Samplers and textures
+
+A Vulkan texture is two objects: an image, which owns the pixels, and a sampler,
+which owns the filter and address state. GL can express that split — sampler
+objects have existed since 3.3 — and it has to, because the split is observable:
+two samplers over one image is a normal thing for an application to do, and any
+driver that folds the sampler into the texture answers both reads with one of
+them.
+
+So `VkSampler` becomes a `glGenSamplers` object and `vkCmdBindDescriptorSets`
+binds it with `glBindSampler` to the texture unit the image occupies. GL then
+combines the unit's texture with the unit's sampler, which is exactly the pair
+the Vulkan descriptor named.
+
+That leaves the interesting half: GLSL has one sampler type that carries both
+halves, and Vulkan's shaders may declare them separately.
+
+- `VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER` is the easy case. The shader's
+  `sampler2D` is rewritten to a texture unit, and the replay binds both the
+  texture and the sampler object to it.
+
+- `VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE` plus `VK_DESCRIPTOR_TYPE_SAMPLER` has no
+  GLSL form at all. SPIRV-Cross's `build_combined_image_samplers()` synthesises a
+  combined sampler for each (image, sampler) pair the shader actually uses, and
+  Kniz gives that sampler the *image's* texture unit, because that is where the
+  image is bound; the sampler object follows it there. The sampler descriptor's
+  own unit is then a unit nothing reads, which is fine and is why sampler
+  descriptors do not appear in the pipeline's used-binding list at all.
+
+  The pairing is discovered by the translator and consumed by the replay, so it
+  travels in the `GlBinding` the translation returns: `sampler_set` and
+  `sampler_binding` name the descriptor whose sampler object belongs on this
+  unit. One image read through two different samplers in the same shader would
+  need two units for one image, which GLSL cannot express without renaming the
+  image; it is refused with an error rather than resolved to one of the two.
+
+- `texelFetch` takes an image and no sampler in Vulkan, and a sampler in GLSL.
+  `build_dummy_sampler_for_combined_images()` supplies one, and Kniz decorates it
+  with a unit past the end of every descriptor in the layout
+  (`PipelineLayout::dummy_sampler_gl_index()`). Nothing needs to be bound there:
+  a fetch ignores sampler state, and the unit exists only so the GLSL compiles.
+  Reserving it is why a layout's texture-unit count is checked against
+  `GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS` with one unit to spare.
+
+Two consequences worth stating plainly, because both are refusals rather than
+approximations:
+
+- An image with more than one mip level cannot be sampled. Kniz creates the full
+  storage a mipmapped image asks for, but only level 0 is ever written — no copy
+  or clear addresses another level — so levels 1 and up hold whatever the driver
+  left there. Refusing at the descriptor write is the honest answer until the
+  transfer path covers mip levels; sampling level 0 explicitly would work, but
+  nothing in the descriptor says the application will only do that.
+
+- A depth image is sampled as a plain value, not as a comparison. Comparison
+  samplers need `sampler2DShadow` and `GL_TEXTURE_COMPARE_MODE`, a different
+  translation path and a different result type, so `compareEnable` is refused at
+  sampler creation. Anisotropic filtering is refused for the same reason: the
+  extension is not resolved and the feature is not reported.
+
 ## 4. Milestones
 
 | | Goal | Proves | Gate |
@@ -456,7 +527,7 @@ with its members read from the wrong place.
 | **M2a** ✅ | Images: creation, memory binding, clear, upload, readback | The first object GL cannot mirror, and the layout asymmetry that comes with it | byte-exact round trip |
 | **M2b** ✅ | Offscreen graphics: render pass → FBO, pipeline → program, draws → image | Passes, pipelines, state, and the coordinate conventions a silently wrong lowering gets wrong | image matches a CPU rasterisation |
 | **M2c** ✅ | Uniform buffers and push constants | The descriptor and binding paths, extended from storage buffers to uniforms, and a construct GL has no equivalent for at all | numeric test passes |
-| **M2d** | Samplers and textures | GL's sampler state lives on the texture where Vulkan's lives on a sampler object | numeric test passes |
+| **M2d** ✅ | Samplers and textures | GL's sampler state lives on the texture where Vulkan's lives on a sampler object | numeric test passes |
 | **M3** | GLX/EGL swapchain | WSI | `vkcube` on screen |
 | **M4** | Fences, events, timestamps, queries | Correctness | sample suite runs |
 
@@ -552,8 +623,8 @@ any allocation that is mapped at all, whether or not its version changed.
 
 What M2a did not cover, and M2b added: render passes, framebuffers and graphics
 pipelines for untextured geometry. Uniform buffers and push constants are M2c,
-and textures and samplers M2d; both are still refused with an explicit error at
-the earliest point the application reveals it needs them. M2a's own remaining
+and textures and samplers M2d; each was refused with an explicit error at the
+earliest point the application reveals it needs them until its milestone landed. M2a's own remaining
 costs, to be revisited: image-only allocations still allocate a full host block
 that the image does not use, a sub-region readback of a mip level costs a
 temporary of the whole level (`glGetTexImage` reads a level, not a rectangle), an
@@ -692,6 +763,62 @@ sequence. Making that airtight means snapshotting the values per draw and
 re-uploading when the binding point has been claimed by something else; it is a
 cost paid per draw, and the failure needs an application to deliberately interleave
 two layouts, so it is recorded rather than paid.
+
+M2d is done: its test (`tests/sampler.cpp`) samples an 8x8 image from a compute
+shader and from a graphics pipeline, and compares every result against arithmetic
+done in the test. It is built around the ways a texture path can be wrong while
+still producing a plausible picture.
+
+- **One image, two samplers.** The compute shader reads the same image through a
+  clamp-to-edge sampler and a repeat sampler, and adds the two reads with
+  different weights. If the filter or wrap state had been written to the texture
+  rather than to a sampler object, the two reads would have to agree. The repeat
+  read is addressed more than a whole wrap past the right edge, so clamp-to-edge
+  would answer with the last column instead.
+
+- **One binding number, two sets.** The second image lives at set 1 binding 0, the
+  same number the first image uses in set 0. Texture units are one flat namespace
+  in GL, so they have to be numbered the way uniform blocks are; a translation
+  that used the binding number directly puts both at unit 0 and the second read
+  answers with the first image.
+
+- **A separate image and sampler.** The second compute shader declares
+  `texture2D` and `sampler` and does both a filtered `texture()` and a
+  `texelFetch()`. The filtered read is at a texel corner, exactly between four
+  texels, so the LINEAR sampler the application bound gives the average of them
+  while a missing sampler object would fall back to the texture's own NEAREST
+  state and give one texel. The fetch is the dummy-sampler path, and it is exact
+  either way, which is the point: the invented sampler must not change the answer.
+
+- **Filtering in a graphics pipeline.** The fragment shader samples at
+  `gl_FragCoord.xy / 64`, so the sample position is fixed by the rasteriser
+  rather than chosen by the test. Each 8x8 block of pixels falls inside one texel
+  with NEAREST; with LINEAR every position is a fixed binary fraction between two
+  texels, so the expected value is exact and the comparison is tight.
+
+The refusals are checked the same way M2c checked its own: a sampler with
+comparison, unnormalized coordinates, anisotropy or mirror-clamp-to-edge is
+refused at creation; an image created without `VK_IMAGE_USAGE_SAMPLED_BIT`, or one
+with two mip levels, is refused at the descriptor write; and in both cases the
+draw that would have used the binding is then refused too, so the render target
+keeps its clear colour rather than showing whatever the last command left bound.
+
+Two mutations were used to confirm the test fails when the driver is wrong, which
+is the only evidence that a gate is a gate. Numbering texture units by their raw
+binding number instead of densely per class makes the second image answer for the
+first, and the compute comparison fails. Ignoring the sampler descriptor for a
+separate image leaves the texture's own NEAREST state in place, and the filtering
+comparison fails. Both were reverted.
+
+M2d's remaining costs, recorded rather than left to be found: every texture-unit
+descriptor is re-bound on every draw and dispatch, including the sampler object,
+with no dirty tracking; the sampler object itself is cheap but the two GL calls
+per unit are not free in a scene that binds hundreds; a descriptor write validates
+the image view every time, which is once per write rather than per draw and so is
+not on the hot path; and the mip-level refusal above means an application that
+allocates a full mip chain for a texture it only ever samples at level 0 is turned
+away, which is a large class of applications. That last one is the first thing the
+transfer path should fix.
 
 ## 5. Non-goals
 

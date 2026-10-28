@@ -274,6 +274,13 @@ VKAPI_ATTR void VKAPI_CALL DestroyImageView(
     VkDevice device, VkImageView imageView,
     const VkAllocationCallbacks* pAllocator);
 
+VKAPI_ATTR VkResult VKAPI_CALL CreateSampler(
+    VkDevice device, const VkSamplerCreateInfo* pCreateInfo,
+    const VkAllocationCallbacks* pAllocator, VkSampler* pSampler);
+
+VKAPI_ATTR void VKAPI_CALL DestroySampler(VkDevice device, VkSampler sampler,
+                                          const VkAllocationCallbacks* pAllocator);
+
 VKAPI_ATTR void VKAPI_CALL CmdClearColorImage(
     VkCommandBuffer commandBuffer, VkImage image, VkImageLayout imageLayout,
     const VkClearColorValue* pColor, uint32_t rangeCount,

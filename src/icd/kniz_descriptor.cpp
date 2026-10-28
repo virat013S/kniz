@@ -1,17 +1,18 @@
 // Descriptor set layouts, pipeline layouts, pools, sets and updates.
 //
-// Two descriptor types are supported: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, which
-// arrived with compute in M1, and VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, which came
-// with the rest of M2c.  They are the same shape -- a buffer, an offset and a
-// range -- and differ only in which GL binding namespace they are indexed by,
-// which is why supporting the second one is a small change here and a larger one
-// in the shader translation, where the two namespaces have to be kept apart.
+// Five descriptor types are supported, in three GL namespaces:
+//
+//   * VK_DESCRIPTOR_TYPE_STORAGE_BUFFER (M1) and VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+//     (M2c) are a buffer, an offset and a range, indexed by two separate buffer
+//     binding namespaces.
+//   * VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
+//     and VK_DESCRIPTOR_TYPE_SAMPLER (M2d) are texture units: GLSL has one
+//     sampler type that carries both an image and its filter state, so a unit
+//     holds a texture, a sampler object, or both.
 //
 // Every other type has a different GL binding point, a different layout rule or
 // both, so they are refused at the earliest point the application reveals its
-// intent.  That produces one clear error instead of a later mysterious one, and
-// it is what makes tests/uniform.cpp's assertion that a sampled image is refused
-// a statement about the driver rather than about a bug.
+// intent.  That produces one clear error instead of a later mysterious one.
 
 #include "kniz_common.h"
 #include "kniz_descriptor.h"
@@ -26,7 +27,10 @@ namespace {
 
 bool descriptor_type_supported(VkDescriptorType type) {
   return type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER ||
-         type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+         type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
+         type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+         type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+         type == VK_DESCRIPTOR_TYPE_SAMPLER;
 }
 
 const char* descriptor_type_name(VkDescriptorType type) {
@@ -56,6 +60,64 @@ const char* descriptor_type_name(VkDescriptorType type) {
     default:
       return "an unrecognised descriptor type";
   }
+}
+
+// Whether this view can be sampled, checked where the application says it wants
+// to sample so that the refusal names a reason instead of turning into black
+// pixels later.
+//
+// The mip rule is the interesting one.  Kniz creates the full storage a
+// mipmapped image asks for, but only level 0 is ever written -- no copy or clear
+// addresses another level -- so levels 1 and up hold whatever the driver left
+// there.  Sampling such an image would read that.  Refusing is the honest
+// answer until the transfer path covers mip levels.
+bool view_is_sampleable(const ImageView* view, uint32_t write) {
+  const Image* image = view->image;
+
+  if (!image->storage_allocated) {
+    KNIZ_ERR("write %u samples an image that has no memory bound to it", write);
+    return false;
+  }
+  if ((image->usage & VK_IMAGE_USAGE_SAMPLED_BIT) == 0) {
+    KNIZ_ERR("write %u samples an image created without "
+             "VK_IMAGE_USAGE_SAMPLED_BIT",
+             write);
+    return false;
+  }
+  if (view->view_type != VK_IMAGE_VIEW_TYPE_2D) {
+    KNIZ_ERR("write %u samples a %s view; Kniz samples one 2D layer",
+             write,
+             view->view_type == VK_IMAGE_VIEW_TYPE_2D_ARRAY ? "2D array" : "3D");
+    return false;
+  }
+
+  const uint32_t layers =
+      view->range.layerCount == VK_REMAINING_ARRAY_LAYERS
+          ? image->array_layers - view->range.baseArrayLayer
+          : view->range.layerCount;
+  if (view->range.baseArrayLayer != 0 || layers != 1) {
+    KNIZ_ERR("write %u samples layer %u of %u; Kniz samples one layer",
+             write, view->range.baseArrayLayer, layers);
+    return false;
+  }
+
+  const uint32_t levels =
+      view->range.levelCount == VK_REMAINING_MIP_LEVELS
+          ? image->mip_levels - view->range.baseMipLevel
+          : view->range.levelCount;
+  if (view->range.baseMipLevel != 0 || levels != 1) {
+    KNIZ_ERR("write %u samples mip level %u of %u; Kniz samples level 0",
+             write, view->range.baseMipLevel, levels);
+    return false;
+  }
+  if (image->mip_levels != 1) {
+    KNIZ_ERR("write %u samples an image with %u mip levels, but only level 0 is "
+             "ever written, so the rest is undefined; Kniz refuses to sample it",
+             write, image->mip_levels);
+    return false;
+  }
+
+  return true;
 }
 
 }  // namespace
@@ -91,9 +153,8 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDescriptorSetLayout(
     const VkDescriptorSetLayoutBinding& binding = pCreateInfo->pBindings[i];
 
     if (!descriptor_type_supported(binding.descriptorType)) {
-      KNIZ_ERR("binding %u uses %s; Kniz implements "
-               "VK_DESCRIPTOR_TYPE_STORAGE_BUFFER and "
-               "VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER",
+      KNIZ_ERR("binding %u uses %s; Kniz implements storage buffers, uniform "
+               "buffers, combined image samplers, sampled images and samplers",
                binding.binding, descriptor_type_name(binding.descriptorType));
       delete layout;
       return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -248,6 +309,7 @@ VKAPI_ATTR VkResult VKAPI_CALL CreatePipelineLayout(
   {
     uint32_t next_uniform = 0;
     uint32_t next_storage = 0;
+    uint32_t next_texture = 0;
 
     // Push constants take uniform binding point 0, ahead of every descriptor.
     // The reason is not that they deserve the first slot: it is that the index
@@ -273,12 +335,37 @@ VKAPI_ATTR VkResult VKAPI_CALL CreatePipelineLayout(
         mapped.set = set;
         mapped.binding = binding.binding;
         mapped.type = binding.type;
-        mapped.gl_index = descriptor_is_uniform(binding.type) ? next_uniform++
-                                                             : next_storage++;
+        switch (descriptor_class(binding.type)) {
+          case DescriptorClass::UniformBuffer:
+            mapped.gl_index = next_uniform++;
+            break;
+          case DescriptorClass::StorageBuffer:
+            mapped.gl_index = next_storage++;
+            break;
+          case DescriptorClass::TextureUnit:
+            mapped.gl_index = next_texture++;
+            break;
+        }
         layout->bindings.push_back(mapped);
       }
     }
     layout->uniform_count = next_uniform;
+    layout->texture_count = next_texture;
+  }
+
+  // A shader that does texelFetch on a separate image needs one texture unit
+  // more than the layout's descriptors occupy, because the sampler GLSL insists
+  // on is injected past the end of the mapping.  Checking it here is what keeps
+  // the shader translation from addressing a unit the driver does not have.
+  if (layout->texture_count + 1 >
+      static_cast<uint32_t>(gl::info().max_texture_units)) {
+    KNIZ_ERR("pipeline layout needs %u texture unit(s), one more than its %u "
+             "image and sampler descriptors for the sampler a texelFetch needs, "
+             "but this driver has %d",
+             layout->texture_count + 1, layout->texture_count,
+             gl::info().max_texture_units);
+    delete layout;
+    return VK_ERROR_FEATURE_NOT_PRESENT;
   }
 
   if (layout->has_push_constants) {
@@ -487,6 +574,43 @@ VKAPI_ATTR void VKAPI_CALL UpdateDescriptorSets(
         continue;
       }
     }
+    if (descriptor_class(write.descriptorType) == DescriptorClass::TextureUnit) {
+      // Image and sampler descriptors.  Vulkan fills pImageInfo for all three
+      // types, and each type reads the fields it needs: a combined image sampler
+      // reads both, a sampled image reads the view, a sampler reads the sampler.
+      if (write.pImageInfo == nullptr) {
+        KNIZ_ERR("write %u carries no image info", i);
+        continue;
+      }
+
+      ImageView* view = nullptr;
+      Sampler* sampler = nullptr;
+
+      if (write.descriptorType != VK_DESCRIPTOR_TYPE_SAMPLER) {
+        view = from_handle(write.pImageInfo->imageView);
+        if (view == nullptr) {
+          KNIZ_ERR("write %u references something that is not a Kniz image view",
+                   i);
+          continue;
+        }
+        if (!view_is_sampleable(view, i))
+          continue;
+      }
+      if (write.descriptorType != VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE) {
+        sampler = from_handle(write.pImageInfo->sampler);
+        if (sampler == nullptr) {
+          KNIZ_ERR("write %u references something that is not a Kniz sampler", i);
+          continue;
+        }
+      }
+
+      DescriptorBinding& binding = set->bindings[write.dstBinding];
+      binding.bound = true;
+      binding.view = view;
+      binding.sampler = sampler;
+      continue;
+    }
+
     if (write.pBufferInfo == nullptr) {
       KNIZ_ERR("write %u carries no buffer info", i);
       continue;
@@ -510,6 +634,78 @@ VKAPI_ATTR void VKAPI_CALL UpdateDescriptorSets(
 // ---------------------------------------------------------------------------
 // Binding descriptors, and push constants, to OpenGL
 // ---------------------------------------------------------------------------
+
+namespace {
+
+// Bind one texture-unit descriptor: the texture at `mapping.gl_index`, and the
+// sampler object that goes with it.
+//
+// The sampler object always goes to the *same* unit as the texture, which is
+// what makes the GLSL `sampler2D` the shader declares read the pair the
+// application meant.  For a combined image sampler both come from one
+// descriptor.  For a separate image the sampler comes from the descriptor the
+// shader paired it with -- recorded at translation time in sampler_set and
+// sampler_binding -- because the image's own binding does not say which sampler
+// reads it.  A separate image with no pairing is read only by texelFetch, which
+// ignores sampler state, so unit 0 (no sampler object) is the right binding.
+bool bind_texture_unit(const GlBinding& mapping,
+                       const std::vector<DescriptorSet*>& sets,
+                       const char* what) {
+  DescriptorSet* set = sets[mapping.set];
+  const DescriptorBinding& binding = set->bindings[mapping.binding];
+
+  if (!binding.bound || binding.view == nullptr) {
+    KNIZ_ERR("set %u binding %u is never written; %s would sample an image that "
+             "was never bound there",
+             mapping.set, mapping.binding, what);
+    return false;
+  }
+
+  const Image* image = binding.view->image;
+  gl::f.ActiveTexture(gl::kTexture0 + mapping.gl_index);
+  gl::f.BindTexture(gl::kTexture2D, image->gl_texture);
+
+  gl::Uint sampler = 0;
+  if (mapping.type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER) {
+    if (binding.sampler == nullptr) {
+      KNIZ_ERR("set %u binding %u is a combined image sampler with no sampler; "
+               "%s would filter the image with whatever was left bound",
+               mapping.set, mapping.binding, what);
+      return false;
+    }
+    sampler = binding.sampler->gl_sampler;
+  } else if (mapping.sampler_set != kNoBinding) {
+    if (mapping.sampler_set >= sets.size() ||
+        sets[mapping.sampler_set] == nullptr ||
+        mapping.sampler_binding >= sets[mapping.sampler_set]->bindings.size()) {
+      KNIZ_ERR("set %u binding %u is read through a sampler at set %u binding "
+               "%u, but no such descriptor is bound",
+               mapping.set, mapping.binding, mapping.sampler_set,
+               mapping.sampler_binding);
+      return false;
+    }
+    const DescriptorBinding& sampler_binding =
+        sets[mapping.sampler_set]->bindings[mapping.sampler_binding];
+    if (!sampler_binding.bound || sampler_binding.sampler == nullptr) {
+      KNIZ_ERR("set %u binding %u is read through a sampler at set %u binding "
+               "%u, which is never written",
+               mapping.set, mapping.binding, mapping.sampler_set,
+               mapping.sampler_binding);
+      return false;
+    }
+    sampler = sampler_binding.sampler->gl_sampler;
+  }
+
+  KNIZ_TRACE("%s: set %u binding %u -> GL texture unit %u = texture %u, "
+             "sampler %u",
+             what, mapping.set, mapping.binding, mapping.gl_index,
+             image->gl_texture, sampler);
+
+  gl::f.BindSampler(mapping.gl_index, sampler);
+  return true;
+}
+
+}  // namespace
 
 bool bind_descriptor_sets(const Pipeline* pipeline,
                           const std::vector<DescriptorSet*>& sets,
@@ -546,6 +742,12 @@ bool bind_descriptor_sets(const Pipeline* pipeline,
     }
 
     const DescriptorBinding& binding = set->bindings[mapping.binding];
+
+    if (descriptor_class(mapping.type) == DescriptorClass::TextureUnit) {
+      ok = bind_texture_unit(mapping, sets, what) && ok;
+      continue;
+    }
+
     if (!binding.bound || binding.buffer == nullptr) {
       KNIZ_ERR("set %u binding %u is never written; %s would read undefined "
                "data",

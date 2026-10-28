@@ -180,6 +180,17 @@ constexpr ProcSlot kTextureProcs[] = {
     {&f.PixelStorei, sizeof(f.PixelStorei), "glPixelStorei"},
 };
 
+// Sampler objects: filter, wrap, LOD and border state with no image in it, which
+// is exactly what a Vulkan sampler is.  Core in 3.3.
+constexpr ProcSlot kSamplerProcs[] = {
+    {&f.GenSamplers, sizeof(f.GenSamplers), "glGenSamplers"},
+    {&f.DeleteSamplers, sizeof(f.DeleteSamplers), "glDeleteSamplers"},
+    {&f.BindSampler, sizeof(f.BindSampler), "glBindSampler"},
+    {&f.SamplerParameteri, sizeof(f.SamplerParameteri), "glSamplerParameteri"},
+    {&f.SamplerParameterf, sizeof(f.SamplerParameterf), "glSamplerParameterf"},
+    {&f.SamplerParameterfv, sizeof(f.SamplerParameterfv), "glSamplerParameterfv"},
+};
+
 // Framebuffers, vertex arrays, draws and raster state.  Core in 3.0, so on any
 // context that got this far the only way these are missing is a broken stack --
 // which is exactly what the capability flag is for.
@@ -470,6 +481,7 @@ bool finish_setup() {
   const bool bytes_ok = load_all(kBufferProcs);
   const bool compute_ok = load_all(kComputeProcs);
   const bool textures_ok = load_all(kTextureProcs);
+  const bool samplers_ok = load_all(kSamplerProcs);
   const bool rendering_ok = load_all(kRenderProcs);
   g_info.compute_capable = version_supports_compute && bytes_ok && compute_ok;
 
@@ -493,6 +505,20 @@ bool finish_setup() {
   const bool version_supports_uniforms =
       g_info.major > 3 || (g_info.major == 3 && g_info.minor >= 1);
   g_info.uniform_capable = version_supports_uniforms && bytes_ok;
+
+  // Sampler objects became core in 3.3.  They are what lets one image be read
+  // through two different filter and wrap settings, so without them a Vulkan
+  // sampler has nowhere to live and sampling is refused rather than made to
+  // depend on the image's own state.
+  const bool version_supports_samplers =
+      g_info.major > 3 || (g_info.major == 3 && g_info.minor >= 3);
+  g_info.sampler_capable = version_supports_samplers && samplers_ok;
+
+  if (g_info.sampler_capable) {
+    gl::Int units = 0;
+    f.GetIntegerv(static_cast<Enum>(kMaxCombinedTextureImageUnits), &units);
+    g_info.max_texture_units = units;
+  }
 
   if (!bytes_ok) {
     KNIZ_ERR("this OpenGL context is missing buffer or program entry points; "
@@ -569,6 +595,13 @@ bool finish_setup() {
   if (g_info.texture_capable)
     KNIZ_INFO("images available: textures, with glTexStorage2D, glClearTexImage "
               "and glGetTexImage");
+  if (g_info.sampler_capable)
+    KNIZ_INFO("samplers available: sampler objects, %d texture unit(s)",
+              g_info.max_texture_units);
+  else
+    KNIZ_INFO("samplers are unavailable: sampler objects need OpenGL 3.3 and "
+              "this is a %d.%d context",
+              g_info.major, g_info.minor);
   if (g_info.render_capable)
     KNIZ_INFO("rendering available: framebuffer objects, vertex array objects, "
               "draws");

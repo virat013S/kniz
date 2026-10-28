@@ -609,10 +609,11 @@ int main(int argc, char** argv) {
                         &rejected_layout) == VK_ERROR_FEATURE_NOT_PRESENT,
         "a dynamic uniform buffer is refused (vkCmdBindDescriptorSets offsets "
         "are not implemented)");
-  check(make_set_layout(VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+  check(make_set_layout(VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                         VK_SHADER_STAGE_FRAGMENT_BIT,
                         &rejected_layout) == VK_ERROR_FEATURE_NOT_PRESENT,
-        "a combined image sampler is refused (that is M2d)");
+        "a storage image is refused (images are read through texture units, "
+        "not written through them)");
   check(make_set_layout(VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,
                         VK_SHADER_STAGE_COMPUTE_BIT,
                         &rejected_layout) == VK_ERROR_FEATURE_NOT_PRESENT,

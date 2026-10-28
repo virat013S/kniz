@@ -37,17 +37,36 @@ bool lookup_gl_index(const std::vector<GlBinding>& bindings, uint32_t set,
 // translation because emitting GLSL that quietly drops a binding is worse than
 // refusing: the application would get plausible output computed from the wrong
 // data.
+//
+// Textures and samplers are *not* on this list any more.  They are lowered
+// rather than refused, and the lowering is the interesting part: see
+// translate_shader.
 std::string unsupported_feature(const spirv_cross::ShaderResources& resources) {
   if (!resources.storage_images.empty())
     return "storage images";
-  if (!resources.sampled_images.empty() || !resources.separate_images.empty() ||
-      !resources.separate_samplers.empty())
-    return "textures or samplers";
   if (!resources.atomic_counters.empty())
     return "atomic counters";
   if (!resources.acceleration_structures.empty())
     return "acceleration structures";
   return {};
+}
+
+// The name of a descriptor type in the words the error messages use.
+const char* descriptor_name(VkDescriptorType type) {
+  switch (type) {
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+      return "uniform buffer";
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+      return "storage buffer";
+    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+      return "combined image sampler";
+    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+      return "sampled image";
+    case VK_DESCRIPTOR_TYPE_SAMPLER:
+      return "sampler";
+    default:
+      return "descriptor";
+  }
 }
 
 const char* stage_name(VkShaderStageFlagBits stage) {
@@ -98,9 +117,7 @@ bool declares_push_constants(const std::vector<uint32_t>& spirv) {
 ShaderTranslation translate_shader(const std::vector<uint32_t>& spirv,
                                    const std::string& entry_point,
                                    VkShaderStageFlagBits stage,
-                                   const std::vector<GlBinding>& bindings,
-                                   uint32_t push_constant_gl_index,
-                                   bool layout_has_push_constants) {
+                                   const PipelineLayout& layout) {
   ShaderTranslation result;
 
   if (spirv.empty()) {
@@ -172,7 +189,7 @@ ShaderTranslation translate_shader(const std::vector<uint32_t>& spirv,
     // point, and a layout with no ranges has a descriptor there instead, so the
     // shader would read a uniform buffer's first bytes as its push constants and
     // produce a plausible wrong answer.
-    if (!resources.push_constant_buffers.empty() && !layout_has_push_constants) {
+    if (!resources.push_constant_buffers.empty() && !layout.has_push_constants) {
       result.error =
           "the " + std::string(stage_name(stage)) + " shader reads push "
           "constants, but the pipeline layout declares no push constant ranges "
@@ -191,14 +208,11 @@ ShaderTranslation translate_shader(const std::vector<uint32_t>& spirv,
             compiler.get_decoration(resource.id, spv::DecorationBinding);
 
         uint32_t gl_index = 0;
-        if (!lookup_gl_index(bindings, set, binding, type, &gl_index)) {
+        if (!lookup_gl_index(layout.bindings, set, binding, type, &gl_index)) {
           // A resource the pipeline layout does not declare.  Sticking it at
           // index 0 would bind it over some other resource, so refuse.
           result.error =
-              "shader declares a " +
-              std::string(type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
-                              ? "uniform buffer"
-                              : "storage buffer") +
+              "shader declares a " + std::string(descriptor_name(type)) +
               " at set " + std::to_string(set) + " binding " +
               std::to_string(binding) +
               ", but the pipeline layout has no such binding";
@@ -210,7 +224,9 @@ ShaderTranslation translate_shader(const std::vector<uint32_t>& spirv,
         // SPIRV-Cross emit layout(set = N, ...), which will not compile.
         compiler.set_decoration(resource.id, spv::DecorationDescriptorSet, 0);
 
-        result.used.push_back(GlBinding{set, binding, gl_index, type});
+        if (!merge_used_binding(result.used, GlBinding{set, binding, gl_index, type},
+                                &result.error))
+          return false;
       }
       return true;
     };
@@ -220,9 +236,91 @@ ShaderTranslation translate_shader(const std::vector<uint32_t>& spirv,
     if (!rewrite(resources.storage_buffers, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER))
       return result;
 
+    // Combined image samplers are the easy half: Vulkan declares one descriptor
+    // and GLSL wants one sampler, so only the binding point has to move.
+    if (!rewrite(resources.sampled_images,
+                 VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER))
+      return result;
+
+    // The hard half.  GLSL has no separate image type, so a separate image and
+    // sampler have to become one combined sampler.  SPIRV-Cross does the
+    // rewriting, and what is left to Kniz is choosing the texture unit the
+    // combined sampler reads: the image's, so that the replay can bind the
+    // sampler object to the same unit and a sampler shared by several images
+    // still works.  The pairing is recorded on the used binding because the
+    // replay needs it to find the sampler descriptor.
+    //
+    // texelFetch on a bare image has no sampler argument in Vulkan and needs one
+    // in GLSL, so SPIRV-Cross injects a dummy sampler.  It is not a descriptor:
+    // it is given the first unit past every descriptor, and nothing has to be
+    // bound there, because a fetch ignores sampler state.
+    const spirv_cross::VariableID dummy_sampler =
+        compiler.build_dummy_sampler_for_combined_images();
+    if (dummy_sampler != 0) {
+      compiler.set_decoration(dummy_sampler, spv::DecorationBinding,
+                              layout.dummy_sampler_gl_index());
+      compiler.set_decoration(dummy_sampler, spv::DecorationDescriptorSet, 0);
+    }
+    compiler.build_combined_image_samplers();
+
+    for (const spirv_cross::CombinedImageSampler& combined :
+         compiler.get_combined_image_samplers()) {
+      const uint32_t image_set =
+          compiler.get_decoration(combined.image_id, spv::DecorationDescriptorSet);
+      const uint32_t image_binding =
+          compiler.get_decoration(combined.image_id, spv::DecorationBinding);
+
+      uint32_t unit = 0;
+      if (!lookup_gl_index(layout.bindings, image_set, image_binding,
+                           VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, &unit)) {
+        result.error =
+            "shader reads the sampled image at set " + std::to_string(image_set) +
+            " binding " + std::to_string(image_binding) +
+            ", but the pipeline layout does not declare a "
+            "VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE there";
+        return result;
+      }
+
+      GlBinding used;
+      used.set = image_set;
+      used.binding = image_binding;
+      used.gl_index = unit;
+      used.type = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+
+      if (combined.sampler_id != dummy_sampler) {
+        const uint32_t sampler_set = compiler.get_decoration(
+            combined.sampler_id, spv::DecorationDescriptorSet);
+        const uint32_t sampler_binding = compiler.get_decoration(
+            combined.sampler_id, spv::DecorationBinding);
+
+        uint32_t sampler_unit = 0;
+        if (!lookup_gl_index(layout.bindings, sampler_set, sampler_binding,
+                             VK_DESCRIPTOR_TYPE_SAMPLER, &sampler_unit)) {
+          result.error =
+              "shader pairs the sampled image at set " +
+              std::to_string(image_set) + " binding " +
+              std::to_string(image_binding) + " with a sampler at set " +
+              std::to_string(sampler_set) + " binding " +
+              std::to_string(sampler_binding) +
+              ", but the pipeline layout does not declare a "
+              "VK_DESCRIPTOR_TYPE_SAMPLER there";
+          return result;
+        }
+        used.sampler_set = sampler_set;
+        used.sampler_binding = sampler_binding;
+      }
+
+      compiler.set_decoration(combined.combined_id, spv::DecorationBinding, unit);
+      compiler.set_decoration(combined.combined_id, spv::DecorationDescriptorSet,
+                              0);
+
+      if (!merge_used_binding(result.used, used, &result.error))
+        return result;
+    }
+
     for (const spirv_cross::Resource& resource : resources.push_constant_buffers) {
       compiler.set_decoration(resource.id, spv::DecorationBinding,
-                              push_constant_gl_index);
+                              layout.push_constant_gl_index);
       compiler.set_decoration(resource.id, spv::DecorationDescriptorSet, 0);
     }
 

@@ -120,19 +120,15 @@ bool compile_program(const std::vector<ShaderSource>& sources, gl::Uint* program
 // the layout; what is collected here is only the subset the shaders actually
 // read, so that a layout shared between pipelines does not require every
 // pipeline to bind every binding it declares.
-void add_used_bindings(Pipeline* pipeline, const ShaderTranslation& translation) {
+bool add_used_bindings(Pipeline* pipeline, const ShaderTranslation& translation) {
   for (const GlBinding& used : translation.used) {
-    bool present = false;
-    for (const GlBinding& existing : pipeline->used_bindings) {
-      if (existing.set == used.set && existing.binding == used.binding &&
-          existing.type == used.type) {
-        present = true;
-        break;
-      }
+    std::string error;
+    if (!merge_used_binding(pipeline->used_bindings, used, &error)) {
+      KNIZ_ERR("%s", error.c_str());
+      return false;
     }
-    if (!present)
-      pipeline->used_bindings.push_back(used);
   }
+  return true;
 }
 
 VkResult build_compute_pipeline(Device* device,
@@ -176,8 +172,7 @@ VkResult build_compute_pipeline(Device* device,
   pipeline->layout = layout;
 
   const ShaderTranslation translation = translate_shader(
-      module->spirv, entry_point, VK_SHADER_STAGE_COMPUTE_BIT, layout->bindings,
-      layout->push_constant_gl_index, layout->has_push_constants);
+      module->spirv, entry_point, VK_SHADER_STAGE_COMPUTE_BIT, *layout);
   if (!translation.ok) {
     KNIZ_ERR("could not translate the compute shader: %s",
              translation.error.c_str());
@@ -185,7 +180,10 @@ VkResult build_compute_pipeline(Device* device,
     return VK_ERROR_INITIALIZATION_FAILED;
   }
   pipeline->glsl = translation.glsl;
-  add_used_bindings(pipeline, translation);
+  if (!add_used_bindings(pipeline, translation)) {
+    delete pipeline;
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
 
   KNIZ_DBG("GLSL generated for pipeline (%zu descriptor binding(s), %zu "
            "push constant range(s)):\n%s",
@@ -678,9 +676,8 @@ VkResult build_graphics_pipeline(Device* device,
 
   std::vector<ShaderSource> sources;
   for (const StageJob& job : jobs) {
-    const ShaderTranslation translation = translate_shader(
-        job.module->spirv, *job.entry, job.stage, layout->bindings,
-        layout->push_constant_gl_index, layout->has_push_constants);
+    const ShaderTranslation translation =
+        translate_shader(job.module->spirv, *job.entry, job.stage, *layout);
     if (!translation.ok) {
       KNIZ_ERR("could not translate the %s shader: %s",
                job.stage == VK_SHADER_STAGE_VERTEX_BIT ? "vertex" : "fragment",
@@ -688,7 +685,10 @@ VkResult build_graphics_pipeline(Device* device,
       delete pipeline;
       return VK_ERROR_INITIALIZATION_FAILED;
     }
-    add_used_bindings(pipeline, translation);
+    if (!add_used_bindings(pipeline, translation)) {
+      delete pipeline;
+      return VK_ERROR_INITIALIZATION_FAILED;
+    }
     if (sources.empty())
       pipeline->glsl = translation.glsl;  // the vertex stage, kept for diagnostics
     sources.push_back(ShaderSource{job.gl_stage, translation.glsl});

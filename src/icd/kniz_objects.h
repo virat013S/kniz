@@ -49,6 +49,7 @@ inline constexpr uint64_t kCommandBufferMagic = 0x4B4E495A434D4442ull;   // KNIZ
 inline constexpr uint64_t kFenceMagic = 0x4B4E495A46454E43ull;           // KNIZFENC
 inline constexpr uint64_t kImageMagic = 0x4B4E495A494D4147ull;           // KNIZIMAG
 inline constexpr uint64_t kImageViewMagic = 0x4B4E495A49565757ull;       // KNIZIVWW
+inline constexpr uint64_t kSamplerMagic = 0x4B4E495A534D504Cull;         // KNIZSMPL
 
 inline constexpr uint64_t kRenderPassMagic = 0x4B4E495A52504C5Aull;     // KNIZRPLZ
 inline constexpr uint64_t kFramebufferMagic = 0x4B4E495A4652414Dull;     // KNIZFRAM
@@ -59,6 +60,10 @@ inline constexpr uint64_t kFramebufferMagic = 0x4B4E495A4652414Dull;     // KNIZ
 // arbitrary choice.  GL has no push constants at all, so they are lowered onto
 // a uniform buffer of exactly this size.
 inline constexpr uint32_t kMaxPushConstantsSize = 128;
+
+// A (set, binding) that does not exist.  Used where a field is optional, so that
+// "no sampler" is distinguishable from "set 0, binding 0".
+inline constexpr uint32_t kNoBinding = 0xFFFFFFFFu;
 
 struct Instance;
 struct PhysicalDevice;
@@ -78,6 +83,7 @@ struct Fence;
 struct PipelineCache;
 struct Image;
 struct ImageView;
+struct Sampler;
 struct RenderPass;
 struct Framebuffer;
 
@@ -265,18 +271,95 @@ struct GlBinding {
   uint32_t binding = 0;
   uint32_t gl_index = 0;
 
-  // Which GL binding namespace the index refers to.  GL keeps uniform buffers
-  // and shader storage buffers in separate spaces that are indexed
+  // Which GL binding namespace the index refers to.  GL keeps uniform buffers,
+  // shader storage buffers and texture units in separate spaces that are indexed
   // independently, so each class is numbered from zero.
   VkDescriptorType type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+
+  // Set when this is a sampled image whose shader pairs it with a *separate*
+  // sampler descriptor: the (set, binding) of that sampler.  GLSL has one
+  // combined sampler for the pair, and it lives at the image's texture unit, so
+  // the sampler object has to be bound to that same unit -- while the sampler
+  // descriptor's own unit is one nothing reads.  kNoBinding when the image is
+  // used through a combined image sampler, which carries its own.
+  uint32_t sampler_set = kNoBinding;
+  uint32_t sampler_binding = kNoBinding;
 };
 
+// GL's resource classes, each with its own flat binding namespace.  A uniform
+// buffer and a storage buffer may both be at binding 0 in one layout, and a
+// texture unit is a third namespace again.
+enum class DescriptorClass {
+  UniformBuffer,
+  StorageBuffer,
+  TextureUnit,
+};
+
+inline DescriptorClass descriptor_class(VkDescriptorType type) {
+  switch (type) {
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+      return DescriptorClass::UniformBuffer;
+    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+    case VK_DESCRIPTOR_TYPE_SAMPLER:
+      return DescriptorClass::TextureUnit;
+    default:
+      return DescriptorClass::StorageBuffer;
+  }
+}
+
 // Descriptors of this type are read-only uniform data rather than read-write
-// storage.  Used to decide which namespace a binding belongs in; everything else
-// about the two is the same shape.
+// storage, or an image read through a texture unit.  Used to decide which
+// namespace a binding belongs in.
 inline bool descriptor_is_uniform(VkDescriptorType type) {
   return type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
          type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+}
+
+// Adds a binding a shader reported to the list a pipeline will bind, merging it
+// with an entry for the same descriptor from another stage.
+//
+// A sampled image carries the sampler it is read through.  One image read
+// through two *different* samplers cannot be expressed -- GL gives a combined
+// sampler one texture unit, and the unit holds one sampler object -- so that is
+// refused rather than silently choosing one.  A texelFetch pairs the image with
+// the injected dummy sampler, which is not a descriptor at all, so it merges
+// into whichever real sampler the image is also read through; a fetch ignores
+// sampler state, so that is exact rather than a compromise.
+inline bool merge_used_binding(std::vector<GlBinding>& list,
+                               const GlBinding& used, std::string* error) {
+  for (GlBinding& existing : list) {
+    if (existing.set != used.set || existing.binding != used.binding ||
+        existing.type != used.type)
+      continue;
+
+    const bool existing_has_sampler = existing.sampler_set != kNoBinding;
+    const bool used_has_sampler = used.sampler_set != kNoBinding;
+    if (existing_has_sampler && used_has_sampler &&
+        (existing.sampler_set != used.sampler_set ||
+         existing.sampler_binding != used.sampler_binding)) {
+      if (error != nullptr) {
+        *error = "the sampled image at set " + std::to_string(used.set) +
+                 " binding " + std::to_string(used.binding) +
+                 " is read through two different samplers, at set " +
+                 std::to_string(existing.sampler_set) + " binding " +
+                 std::to_string(existing.sampler_binding) + " and set " +
+                 std::to_string(used.sampler_set) + " binding " +
+                 std::to_string(used.sampler_binding) +
+                 "; OpenGL gives a combined sampler one texture unit, so Kniz "
+                 "cannot express that";
+      }
+      return false;
+    }
+    if (!existing_has_sampler && used_has_sampler) {
+      existing.sampler_set = used.sampler_set;
+      existing.sampler_binding = used.sampler_binding;
+    }
+    return true;
+  }
+  list.push_back(used);
+  return true;
 }
 
 struct DescriptorSetLayoutBinding {
@@ -320,6 +403,17 @@ struct PipelineLayout {
   uint32_t uniform_count = 0;
   uint32_t push_constant_gl_index = 0;
 
+  // How many texture units the layout's image and sampler descriptors occupy.
+  // A shader that does texelFetch on a separate image needs a sampler argument
+  // that Vulkan does not require, so SPIRV-Cross injects one; it is given the
+  // first unit past every descriptor, which is why the count is here and not
+  // just the mapping.
+  uint32_t texture_count = 0;
+
+  // That first unit past every descriptor, i.e. where the injected sampler
+  // lives.  Meaningful only when texture_count is non-zero.
+  uint32_t dummy_sampler_gl_index() const { return texture_count; }
+
   // The pipeline layout's push constant ranges, and the end of the last one.
   // GL has no push constants, so they are lowered onto a uniform buffer that
   // Kniz owns and uploads to before each draw or dispatch.
@@ -330,9 +424,17 @@ struct PipelineLayout {
 
 struct DescriptorBinding {
   bool bound = false;
+
+  // A buffer descriptor's contents.  Null for an image or sampler descriptor,
+  // which is why `bound` exists rather than a null check on one pointer.
   Buffer* buffer = nullptr;
   uint64_t offset = 0;
   uint64_t range = 0;
+
+  // An image descriptor's contents.  A sampled image needs the view; a combined
+  // image sampler needs the sampler as well; a bare sampler needs only that.
+  ImageView* view = nullptr;
+  Sampler* sampler = nullptr;
 };
 
 struct DescriptorSet {
@@ -666,6 +768,18 @@ struct ImageView {
   VkImageSubresourceRange range{};
 };
 
+// A Vulkan sampler is filter, wrap, LOD and border state with no image in it.
+// That is exactly what a GL sampler object is, so the translation is direct --
+// and it has to be an object rather than texture state, because two samplers may
+// read one image with different settings and GL keeps the two kinds of state
+// separate for precisely that reason.
+struct Sampler {
+  uint64_t magic = kSamplerMagic;
+  Device* device = nullptr;
+
+  gl::Uint gl_sampler = 0;
+};
+
 // ---------------------------------------------------------------------------
 // M2b objects: drawing
 // ---------------------------------------------------------------------------
@@ -801,6 +915,10 @@ inline ImageView* from_handle(VkImageView handle) {
   return detail::to_object<ImageView>(kImageViewMagic, handle);
 }
 
+inline Sampler* from_handle(VkSampler handle) {
+  return detail::to_object<Sampler>(kSamplerMagic, handle);
+}
+
 inline RenderPass* from_handle(VkRenderPass handle) {
   return detail::to_object<RenderPass>(kRenderPassMagic, handle);
 }
@@ -864,6 +982,10 @@ inline VkImage to_handle(Image* object) {
 
 inline VkImageView to_handle(ImageView* object) {
   return reinterpret_cast<VkImageView>(object);
+}
+
+inline VkSampler to_handle(Sampler* object) {
+  return reinterpret_cast<VkSampler>(object);
 }
 
 inline VkRenderPass to_handle(RenderPass* object) {

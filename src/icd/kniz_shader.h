@@ -37,20 +37,26 @@ struct ShaderTranslation {
 // which stage it is: the same SPIR-V can hold several entry points, and the
 // execution model is what says which one a given stage means.
 //
-// The mapping is passed in rather than derived here because GL binding points
-// are flat while Vulkan addresses descriptors by (set, binding): two resources
-// in different sets may legally share a binding number, and the only way to
-// give them distinct GL points is to know the whole pipeline layout.  Deriving
-// the mapping in one place -- pipeline layout creation -- is what keeps the
-// generated GLSL and the replay path from disagreeing.
+// The layout is passed in rather than the mapping being derived here because GL
+// binding points are flat while Vulkan addresses descriptors by (set, binding):
+// two resources in different sets may legally share a binding number, and the
+// only way to give them distinct GL points is to know the whole pipeline layout.
+// Deriving the mapping in one place -- pipeline layout creation -- is what keeps
+// the generated GLSL and the replay path from disagreeing.
 //
-// `push_constant_gl_index` is the uniform binding point reserved for push
-// constants, which GL does not have: they are lowered onto a uniform buffer
-// that Kniz uploads to as the recorded commands replay.  See kniz_descriptor.cpp.
-// `layout_has_push_constants` says whether the pipeline layout declares any
-// ranges at all, which is what makes that binding point meaningful: a shader that
-// reads push constants against a layout with no ranges is refused here rather
-// than left to read a descriptor's bytes.
+// Three constructs have no GLSL equivalent and are lowered here rather than in
+// the replay path, because the shader is the only place that knows they exist:
+//
+//   * Push constants become a uniform block at `layout.push_constant_gl_index`,
+//     which the replay uploads to as the recorded commands replay.
+//   * Separate images and samplers become combined image samplers, because GLSL
+//     has one sampler type that carries both.  The combined sampler lives at the
+//     *image's* texture unit, so the replay binds the sampler object to that same
+//     unit; a shader that reads one image through two different samplers cannot
+//     be expressed that way and is refused.
+//   * A `texelFetch` on a separate image needs a sampler argument in GLSL that
+//     Vulkan does not require, so SPIRV-Cross injects a dummy one at
+//     `layout.texture_count`, the first unit past every descriptor.
 //
 // The clip space fixup is applied for vertex stages and must not be applied for
 // any other: GL and Vulkan disagree about the depth range ([-w, w] against
@@ -59,8 +65,6 @@ struct ShaderTranslation {
 ShaderTranslation translate_shader(const std::vector<uint32_t>& spirv,
                                    const std::string& entry_point,
                                    VkShaderStageFlagBits stage,
-                                   const std::vector<GlBinding>& bindings,
-                                   uint32_t push_constant_gl_index,
-                                   bool layout_has_push_constants);
+                                   const PipelineLayout& layout);
 
 }  // namespace kniz

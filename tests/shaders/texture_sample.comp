@@ -1,0 +1,51 @@
+#version 450
+
+// M2d test compute shader: read one image through three samplers.
+//
+// Three things have to be true for this to produce the number the test expects,
+// and each of them is a different part of the milestone:
+//
+//   * `source` and `wrapped` are the *same image* seen through two different
+//     samplers.  Kniz binds a Vulkan sampler as a GL sampler object, which is
+//     per texture unit rather than per image; if it had put the filter and wrap
+//     state on the texture instead, these two reads would have to agree and the
+//     sum below would be wrong.
+//
+//   * `wrapped` is addressed at (x + 8.5) / 8, which is more than one whole
+//     wrap past the right edge.  With VK_SAMPLER_ADDRESS_MODE_REPEAT that is
+//     texel x; with clamp to edge it would be texel 7 for every x.
+//
+//   * `filtered` lives in a different descriptor set at the same binding number
+//     as `source`, which GL cannot express directly: both have to end up at
+//     different texture units.
+//
+// texelFetch on a combined image sampler needs no sampler at all in Vulkan and
+// works directly here, which is the cheap half of the texture story.
+//
+// The weights 1, 2 and 4 make each of the three terms visible in the low bits of
+// the sum, so no one of them can be wrong without changing the result.
+//
+// Regenerate with:
+//
+//   glslangValidator -V -o texture_sample.comp.spv texture_sample.comp
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) uniform sampler2D source;
+layout(set = 0, binding = 1) uniform sampler2D wrapped;
+layout(set = 1, binding = 0) uniform sampler2D filtered;
+
+layout(set = 0, binding = 2) buffer Result {
+    vec4 values[];
+} result;
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+    const ivec2 coord = ivec2(int(index % 8u), int(index / 8u));
+
+    const vec4 fetched = texelFetch(source, coord, 0);
+    const vec4 repeated = texture(wrapped, (vec2(coord) + vec2(8.5, 0.5)) / 8.0);
+    const vec4 blended = texture(filtered, vec2(0.5));
+
+    result.values[index] = fetched + 2.0 * repeated + 4.0 * blended;
+}

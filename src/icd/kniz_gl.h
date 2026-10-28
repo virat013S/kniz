@@ -24,6 +24,7 @@ namespace kniz::gl {
 using Enum = unsigned int;
 using Uint = unsigned int;
 using Int = int;
+using Float = float;
 using Size = int;
 using SizePtr = std::ptrdiff_t;
 using IntPtr = std::ptrdiff_t;
@@ -72,6 +73,17 @@ struct ContextInfo {
   // 256, and this driver reports 256, so no legal offset is refused here unless
   // a GL driver wanted more than the specification permits.
   int ubo_offset_alignment = 0;
+
+  // Sampler objects, i.e. glGenSamplers and friends.  Core in 3.3, so this is
+  // the point at which a Vulkan sampler can be represented at all: without one,
+  // filtering and addressing would have to live on the texture, which is
+  // per-image state rather than per-sampler state and would make two samplers
+  // over one image indistinguishable.
+  bool sampler_capable = false;
+
+  // GL_MAX_COMBINED_TEXTURE_IMAGE_UNITS, which bounds the texture-unit
+  // namespace the same way GL_MAX_*_BUFFER_BINDINGS bounds the buffer ones.
+  int max_texture_units = 0;
 };
 
 // Create a headless GL context and make it current on the calling thread.
@@ -164,6 +176,19 @@ struct Functions {
   void (*ClearTexImage)(Enum texture, Int level, Enum format, Enum type,
                         const void* data) = nullptr;
   void (*PixelStorei)(Enum pname, Int param) = nullptr;
+
+  // ---- M2d: samplers ------------------------------------------------------
+  //
+  // A Vulkan sampler is filter, wrap, LOD and border state with no image in it,
+  // which is exactly what a GL sampler object is.  The alternative -- setting
+  // the state on the texture -- would make two samplers over one image
+  // impossible to distinguish, which is the whole point of the Vulkan object.
+  void (*GenSamplers)(Size n, Uint* samplers) = nullptr;
+  void (*DeleteSamplers)(Size n, const Uint* samplers) = nullptr;
+  void (*BindSampler)(Uint unit, Uint sampler) = nullptr;
+  void (*SamplerParameteri)(Uint sampler, Enum pname, Int param) = nullptr;
+  void (*SamplerParameterf)(Uint sampler, Enum pname, Float param) = nullptr;
+  void (*SamplerParameterfv)(Uint sampler, Enum pname, const Float* param) = nullptr;
 
   // ---- M2b: framebuffers, vertex arrays and draws -------------------------
   //
@@ -274,9 +299,22 @@ inline constexpr Enum kTextureMinFilter = 0x2801;
 inline constexpr Enum kTextureMagFilter = 0x2800;
 inline constexpr Enum kTextureWrapS = 0x2802;
 inline constexpr Enum kTextureWrapT = 0x2803;
+inline constexpr Enum kTextureWrapR = 0x8072;
+inline constexpr Enum kTextureBorderColor = 0x1004;
+inline constexpr Enum kTextureMinLod = 0x813A;
+inline constexpr Enum kTextureMaxLod = 0x813B;
+inline constexpr Enum kTextureLodBias = 0x8501;
 inline constexpr Int kNearest = 0x2600;
 inline constexpr Int kLinear = 0x2601;
+inline constexpr Int kNearestMipmapNearest = 0x2700;
+inline constexpr Int kLinearMipmapNearest = 0x2701;
+inline constexpr Int kNearestMipmapLinear = 0x2702;
+inline constexpr Int kLinearMipmapLinear = 0x2703;
+inline constexpr Int kRepeat = 0x2901;
+inline constexpr Int kMirroredRepeat = 0x8370;
 inline constexpr Int kClampToEdge = 0x812F;
+inline constexpr Int kClampToBorder = 0x812D;
+inline constexpr Enum kMaxCombinedTextureImageUnits = 0x8B4D;
 inline constexpr Enum kTextureBaseLevel = 0x813C;
 inline constexpr Enum kTextureMaxLevel = 0x813D;
 

@@ -725,4 +725,183 @@ VKAPI_ATTR void VKAPI_CALL DestroyImageView(
   delete view;
 }
 
+// ---------------------------------------------------------------------------
+// Samplers
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Vulkan's address modes on GL's wrap parameters.  VK_SAMPLER_ADDRESS_MODE_*
+// and GL's wrap modes are the same four behaviours; the fifth, mirror clamp to
+// edge, is a Vulkan extension this driver does not report.
+bool gl_wrap_mode(VkSamplerAddressMode mode, gl::Int* out) {
+  switch (mode) {
+    case VK_SAMPLER_ADDRESS_MODE_REPEAT:
+      *out = gl::kRepeat;
+      return true;
+    case VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT:
+      *out = gl::kMirroredRepeat;
+      return true;
+    case VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE:
+      *out = gl::kClampToEdge;
+      return true;
+    case VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER:
+      *out = gl::kClampToBorder;
+      return true;
+    default:
+      return false;
+  }
+}
+
+// GL has one minification filter that names the mipmap mode and one that does
+// not, while Vulkan splits the same information across minFilter and mipmapMode.
+// All four combinations are expressible; this is the table.
+gl::Int gl_min_filter(VkFilter filter, VkSamplerMipmapMode mipmap) {
+  if (filter == VK_FILTER_NEAREST)
+    return mipmap == VK_SAMPLER_MIPMAP_MODE_NEAREST ? gl::kNearestMipmapNearest
+                                                   : gl::kNearestMipmapLinear;
+  return mipmap == VK_SAMPLER_MIPMAP_MODE_NEAREST ? gl::kLinearMipmapNearest
+                                                 : gl::kLinearMipmapLinear;
+}
+
+void border_colour(VkBorderColor colour, gl::Float out[4]) {
+  out[0] = 0.0f;
+  out[1] = 0.0f;
+  out[2] = 0.0f;
+  out[3] = 0.0f;
+  switch (colour) {
+    case VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK:
+    case VK_BORDER_COLOR_INT_OPAQUE_BLACK:
+      out[3] = 1.0f;
+      break;
+    case VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE:
+    case VK_BORDER_COLOR_INT_OPAQUE_WHITE:
+      out[0] = out[1] = out[2] = out[3] = 1.0f;
+      break;
+    default:
+      // The two transparent blacks are already in `out`.
+      break;
+  }
+}
+
+}  // namespace
+
+VKAPI_ATTR VkResult VKAPI_CALL CreateSampler(
+    VkDevice deviceHandle, const VkSamplerCreateInfo* pCreateInfo,
+    const VkAllocationCallbacks* pAllocator, VkSampler* pSampler) {
+  (void)pAllocator;
+  if (pSampler == nullptr)
+    return VK_ERROR_INITIALIZATION_FAILED;
+  *pSampler = VK_NULL_HANDLE;
+
+  Device* device = from_handle(deviceHandle);
+  if (device == nullptr || pCreateInfo == nullptr)
+    return VK_ERROR_INITIALIZATION_FAILED;
+
+  if (!image_gl_ready(device))
+    return VK_ERROR_INITIALIZATION_FAILED;
+
+  if (!device->instance->gl.sampler_capable) {
+    KNIZ_ERR("samplers need GL sampler objects, which this OpenGL context does "
+             "not have");
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+  }
+
+  if (pCreateInfo->flags != 0) {
+    KNIZ_ERR("sampler flags 0x%x are not implemented",
+             static_cast<unsigned>(pCreateInfo->flags));
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+  }
+  if (pCreateInfo->unnormalizedCoordinates != VK_FALSE) {
+    KNIZ_ERR("unnormalized sampler coordinates are not implemented");
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+  }
+  if (pCreateInfo->compareEnable != VK_FALSE) {
+    // Comparison samplers need GL_TEXTURE_COMPARE_MODE and a shadow sampler in
+    // the shader, which is a different translation path than plain sampling.
+    KNIZ_ERR("comparison samplers are not implemented; Kniz samples depth "
+             "images as plain values");
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+  }
+  if (pCreateInfo->anisotropyEnable != VK_FALSE) {
+    // The driver reports samplerAnisotropy = VK_FALSE, so an application that
+    // asks for it is going beyond what was offered; the extension is not
+    // resolved either, so there is nothing to enable.
+    KNIZ_ERR("anisotropic filtering is not implemented");
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+  }
+
+  gl::Int wrap_u = 0;
+  gl::Int wrap_v = 0;
+  if (!gl_wrap_mode(pCreateInfo->addressModeU, &wrap_u) ||
+      !gl_wrap_mode(pCreateInfo->addressModeV, &wrap_v)) {
+    KNIZ_ERR("sampler address mode %d/%d is not one OpenGL has",
+             static_cast<int>(pCreateInfo->addressModeU),
+             static_cast<int>(pCreateInfo->addressModeV));
+    return VK_ERROR_FEATURE_NOT_PRESENT;
+  }
+  // addressModeW is not checked: Kniz samples 2D images, where it has no
+  // effect, and refusing a value nothing reads would refuse legal applications.
+
+  Sampler* sampler = new (std::nothrow) Sampler();
+  if (sampler == nullptr)
+    return VK_ERROR_OUT_OF_HOST_MEMORY;
+  sampler->device = device;
+
+  gl::f.GenSamplers(1, &sampler->gl_sampler);
+  if (sampler->gl_sampler == 0) {
+    KNIZ_ERR("glGenSamplers failed");
+    delete sampler;
+    return VK_ERROR_OUT_OF_HOST_MEMORY;
+  }
+
+  gl::f.SamplerParameteri(sampler->gl_sampler, gl::kTextureMagFilter,
+                          pCreateInfo->magFilter == VK_FILTER_NEAREST
+                              ? gl::kNearest
+                              : gl::kLinear);
+  gl::f.SamplerParameteri(sampler->gl_sampler, gl::kTextureMinFilter,
+                          gl_min_filter(pCreateInfo->minFilter,
+                                        pCreateInfo->mipmapMode));
+  gl::f.SamplerParameteri(sampler->gl_sampler, gl::kTextureWrapS, wrap_u);
+  gl::f.SamplerParameteri(sampler->gl_sampler, gl::kTextureWrapT, wrap_v);
+  // A 2D image has no W coordinate, so the value is only set to keep the
+  // sampler object from carrying a driver default that a 3D-capable path would
+  // later pick up.
+  gl::f.SamplerParameteri(sampler->gl_sampler, gl::kTextureWrapR, gl::kClampToEdge);
+
+  gl::Float border[4];
+  border_colour(pCreateInfo->borderColor, border);
+  gl::f.SamplerParameterfv(sampler->gl_sampler, gl::kTextureBorderColor, border);
+
+  gl::f.SamplerParameterf(sampler->gl_sampler, gl::kTextureMinLod,
+                          pCreateInfo->minLod);
+  gl::f.SamplerParameterf(sampler->gl_sampler, gl::kTextureMaxLod,
+                          pCreateInfo->maxLod);
+  gl::f.SamplerParameterf(sampler->gl_sampler, gl::kTextureLodBias,
+                          pCreateInfo->mipLodBias);
+
+  if (gl::report_errors("after creating a sampler")) {
+    gl::f.DeleteSamplers(1, &sampler->gl_sampler);
+    delete sampler;
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+
+  *pSampler = to_handle(sampler);
+  return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL DestroySampler(
+    VkDevice deviceHandle, VkSampler samplerHandle,
+    const VkAllocationCallbacks* pAllocator) {
+  (void)pAllocator;
+  Device* device = from_handle(deviceHandle);
+  Sampler* sampler = from_handle(samplerHandle);
+  if (device == nullptr || sampler == nullptr)
+    return;
+  if (sampler->gl_sampler != 0 && device->instance->gl_ready &&
+      gl::make_current())
+    gl::f.DeleteSamplers(1, &sampler->gl_sampler);
+  delete sampler;
+}
+
 }  // namespace kniz

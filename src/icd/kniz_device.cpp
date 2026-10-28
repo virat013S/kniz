@@ -106,6 +106,8 @@ const Entry kEntries[] = {
     {"vkGetImageSubresourceLayout", as_entry(GetImageSubresourceLayout)},
     {"vkCreateImageView", as_entry(CreateImageView)},
     {"vkDestroyImageView", as_entry(DestroyImageView)},
+    {"vkCreateSampler", as_entry(CreateSampler)},
+    {"vkDestroySampler", as_entry(DestroySampler)},
     {"vkCmdClearColorImage", as_entry(CmdClearColorImage)},
     {"vkCmdCopyBufferToImage", as_entry(CmdCopyBufferToImage)},
     {"vkCmdCopyImageToBuffer", as_entry(CmdCopyImageToBuffer)},

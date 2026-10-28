@@ -1,0 +1,45 @@
+#version 450
+
+// Vulkan's texelFetch takes an image alone; GLSL insists on a sampler, so this
+// extension is what lets the source express the case at all.  SPIRV-Cross then
+// has to put a sampler back, which is one of the paths under test.
+#extension GL_EXT_samplerless_texture_functions : require
+
+// M2d test compute shader: a separate image and sampler, which is what Vulkan
+// calls VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE and VK_DESCRIPTOR_TYPE_SAMPLER.
+//
+// GLSL has no separate image type, so Kniz asks SPIRV-Cross to combine the pair
+// into one sampler and gives it the image's texture unit.  The sampler object
+// has to be bound to that same unit, which is the part Kniz has to get right:
+// the sampler descriptor's own unit is one nothing reads.
+//
+// The two reads are chosen so that a missing sampler object is visible.  The
+// bilinear read is at a texel corner (coord / 8), exactly between four texels,
+// so with the LINEAR sampler the application bound it is the average of them,
+// while with no sampler object -- the texture's own default, NEAREST -- it would
+// be a single texel.  The texelFetch is exact either way, and doubles as the
+// case where SPIRV-Cross has to inject a dummy sampler because GLSL's texelFetch
+// takes one and Vulkan's does not.
+//
+// Regenerate with:
+//
+//   glslangValidator -V -o texture_separate.comp.spv texture_separate.comp
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0) uniform texture2D image;
+layout(set = 0, binding = 1) uniform sampler samp;
+
+layout(set = 0, binding = 2) buffer Result {
+    vec4 values[];
+} result;
+
+void main() {
+    const uint index = gl_GlobalInvocationID.x;
+    const ivec2 coord = ivec2(int(index % 8u), int(index / 8u));
+
+    const vec4 filtered = texture(sampler2D(image, samp), vec2(coord) / 8.0);
+    const vec4 fetched = texelFetch(image, coord, 0);
+
+    result.values[index] = filtered + 2.0 * fetched;
+}

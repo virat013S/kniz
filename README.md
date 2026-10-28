@@ -37,12 +37,13 @@ The honest, reachable goal:
 
 ## Status
 
-**M2c complete.** Kniz registers as a Vulkan ICD, the loader hands it an instance
+**M2d complete.** Kniz registers as a Vulkan ICD, the loader hands it an instance
 and a device, it brings up a real OpenGL context to back them, and it can run a
 compute shader over storage buffers and uniform buffers, move image contents to
-and from buffers, and draw untextured geometry into an image through a render pass
-and a graphics pipeline, with uniform buffers and push constants reaching both
-kinds of shader. It does not present anything to a window yet.
+and from buffers, and draw textured geometry into an image through a render pass
+and a graphics pipeline, with uniform buffers, push constants, samplers and
+textures reaching both kinds of shader. It does not present anything to a window
+yet.
 
 Working today:
 
@@ -68,12 +69,18 @@ Working today:
 - Push constants, which OpenGL has no equivalent of, lowered onto a uniform buffer
   the driver owns and uploaded as the recorded commands replay — verified by
   running the same pipeline twice with different values and requiring both results
+- Samplers and textures, in compute and in graphics: combined image samplers,
+  separate image and sampler pairs, and `texelFetch` on a bare image — verified
+  against a CPU evaluation of the same filtering, with the same image read through
+  two different samplers and two images at the same binding number in different
+  sets, which are the two ways a texture path can be quietly wrong
 
-Not implemented: samplers, depth and stencil attachments, blending,
-multisampling, instancing, geometry and tessellation stages, dynamic uniform
-buffers, and presentation. Each is refused with a specific error at the point the
-application reveals it needs one, rather than accepted and silently ignored. Two
-refusals are permanent rather than pending, and both are argued in
+Not implemented: depth and stencil attachments, blending, multisampling,
+instancing, geometry and tessellation stages, dynamic uniform buffers, comparison
+samplers, anisotropic filtering, mip levels above 0, and presentation. Each is
+refused with a specific error at the point the application reveals it needs one,
+rather than accepted and silently ignored. Two refusals are permanent rather than
+pending, and both are argued in
 [`docs/DESIGN.md`](docs/DESIGN.md):
 
 - `VK_IMAGE_TILING_LINEAR` — a linear image's layout is observable and OpenGL's
@@ -81,7 +88,7 @@ refusals are permanent rather than pending, and both are argued in
 - Mapping a `VkDeviceMemory` that an image is bound to — an image is a GL
   texture, so the allocation does not hold its pixels.
 
-Next is M2d for samplers and textures, then M3 for a swapchain and a window.
+Next is M3 for a swapchain and a window, which is what `vkcube` needs.
 
 ## Building
 
@@ -141,25 +148,28 @@ Device
   device extensions      0
 
 What is implemented
-  loader handshake, instance/device    yes  M0
-  properties, limits, memory model     yes  M0
-  buffers and memory objects           yes  M1
-  SPIR-V -> GLSL translation           yes  M1
-  descriptor sets (storage buffers)    yes  M1
-  compute dispatch                     yes  M1
+  loader handshake, instance/device        yes  M0
+  properties, limits, memory model         yes  M0
+  buffers and memory objects               yes  M1
+  SPIR-V -> GLSL translation               yes  M1
+  descriptor sets (storage buffers)        yes  M1
+  compute dispatch                         yes  M1
   images, image views, memory binding      yes  M2a
   images: clear, upload, readback          yes  M2a
   render passes, framebuffers, draws       yes  M2b
   graphics pipelines and rasterisation     yes  M2b
   uniform buffers                          yes  M2c
   push constants                           yes  M2c (lowered onto a uniform buffer)
+  samplers                                 yes  M2d (GL sampler objects)
+  textures in shaders                      yes  M2d (combined or separate)
   linear tiling (layout is observable)     no   never planned
   images: storage, input attachments       no   not implemented
   mapping an image's allocation            no   impossible, see DESIGN.md
   depth, stencil, blending, multisampling  no   M2b refused on purpose
   dynamic uniform buffers                  no   M2c refused on purpose
   push constants: non-std140 packing       no   OpenGL cannot express it, see DESIGN.md
-  samplers and textures in shaders         no   M2d
+  comparison samplers, anisotropy          no   M2d refused on purpose
+  sampling mip levels above 0              no   only level 0 is ever written, see DESIGN.md
   swapchain / window presentation          no   M3
   fences, queries, timestamps              no   M4
 ```
@@ -254,13 +264,30 @@ See the note in [`docs/DESIGN.md`](docs/DESIGN.md).
   that std140 cannot express — Vulkan packs an array of scalars more tightly than a
   GLSL uniform block can be packed — is asserted to be refused at pipeline
   creation rather than lowered with its members at the wrong offsets.
+- `sampler` — samplers and textures (M2d), in a compute and a graphics pipeline.
+  One 8×8 image is read through a clamp-to-edge sampler and a repeat sampler at
+  once, which is the check that filter and wrap state lives on the sampler rather
+  than on the texture; a second image sits at the *same* binding number in the
+  *next* descriptor set, which is the check that texture units are numbered
+  densely rather than by binding number; and a separate image and sampler pair is
+  sampled and `texelFetch`ed, which are the two paths SPIR-V has and GLSL does
+  not. Every result is compared against arithmetic performed in the test: the
+  filtered reads sit at texel corners, exactly between four texels, so a missing
+  sampler object falls back to the texture's own NEAREST state and disagrees. The
+  graphics phase samples at `gl_FragCoord.xy / 64`, so the sample position is
+  fixed by the rasteriser instead of chosen by the test, and each of the 4096
+  pixels is compared. Comparison samplers, unnormalized coordinates, anisotropy and
+  mirror-clamp-to-edge are asserted to be refused at sampler creation; an image
+  without `VK_IMAGE_USAGE_SAMPLED_BIT`, and one with more than one mip level, are
+  refused at the descriptor write, which is then proved by the draw that would
+  have used the binding being refused too.
 
 The shaders the tests use are checked in twice: as GLSL, and as the compiled
 SPIR-V an application would actually submit. The command that regenerates each
 SPIR-V file is recorded at the top of the GLSL it came from
-(`tests/shaders/scale.comp`, the four that `draw` uses, and the four that
-`uniform` uses), and the compiled forms are committed so that the test suite does
-not depend on `glslangValidator` being installed.
+(`tests/shaders/scale.comp`, the four that `draw` uses, the four that `uniform`
+uses and the four that `sampler` uses), and the compiled forms are committed so
+that the test suite does not depend on `glslangValidator` being installed.
 
 ## Layout
 

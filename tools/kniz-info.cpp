@@ -415,6 +415,8 @@ int main(int argc, char** argv) {
   capability("graphics pipelines and rasterisation", true, "M2b");
   capability("uniform buffers", true, "M2c");
   capability("push constants", true, "M2c (lowered onto a uniform buffer)");
+  capability("samplers", true, "M2d (GL sampler objects)");
+  capability("textures in shaders", true, "M2d (combined or separate)");
   capability("linear tiling (layout is observable)", false, "never planned");
   capability("images: storage, input attachments", false, "not implemented");
   capability("mapping an image's allocation", false, "impossible, see DESIGN.md");
@@ -422,7 +424,10 @@ int main(int argc, char** argv) {
   capability("dynamic uniform buffers", false, "M2c refused on purpose");
   capability("push constants: non-std140 packing", false,
              "OpenGL cannot express it, see DESIGN.md");
-  capability("samplers and textures in shaders", false, "M2d");
+  capability("comparison samplers, anisotropy", false,
+             "M2d refused on purpose");
+  capability("sampling mip levels above 0", false,
+             "only level 0 is ever written, see DESIGN.md");
   capability("swapchain / window presentation", false, "M3");
   capability("fences, queries, timestamps", false, "M4");
 
@@ -436,14 +441,18 @@ int main(int argc, char** argv) {
       "  geometry rather than merely eyeballed.  Uniform buffers are read by both\n"
       "  compute and graphics shaders, including two blocks that share a binding\n"
       "  number in different sets, and push constants arrive in the shader that\n"
-      "  declared them.\n"
+      "  declared them.  Textures are sampled in both compute and graphics shaders,\n"
+      "  through combined image samplers and through a separate image and sampler,\n"
+      "  with the filter and address modes coming from the sampler object rather\n"
+      "  than from the image.\n"
       "\n  Not implemented yet, and refused with a specific error rather than\n"
       "  approximated: depth and stencil, blending, multisampling, instancing,\n"
       "  geometry and tessellation stages, more than one subpass or a depth\n"
-      "  attachment, dynamic uniform buffers, samplers, and presentation.\n"
+      "  attachment, dynamic uniform buffers, comparison samplers, anisotropic\n"
+      "  filtering, mip levels above 0, and presentation.\n"
       "  Programs that create a device, ask questions about it, run a compute shader\n"
-      "  over buffers, move image contents, or draw untextured geometry from uniform\n"
-      "  data will work.\n"
+      "  over buffers, move image contents, or draw geometry textured from uniform\n"
+      "  and sampler data will work.\n"
       "  See docs/DESIGN.md for what OpenGL cannot express at all.\n"
       "\n  The 'kniz:' lines above are the driver's own log, including the\n"
       "  OpenGL context it created to back this device.\n");
