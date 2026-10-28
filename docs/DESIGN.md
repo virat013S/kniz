@@ -683,7 +683,7 @@ first submit: as objects they exist — created, destroyed, passed around freely
 but they carry no state, because every submission and every present
 is synchronous and their only legal observable state window is empty.
 `vkCreateSemaphore` with a timeline type is refused at creation, and a timeline
-semaphore is one of §5's non-goals.
+semaphore is one of §7's non-goals.
 
 ## 4. Milestones
 
@@ -697,7 +697,10 @@ semaphore is one of §5's non-goals.
 | **M2d** ✅ | Samplers and textures | GL's sampler state lives on the texture where Vulkan's lives on a sampler object | numeric test passes |
 | **M3a** ✅ | Swapchain and presentation on an X11 window | WSI: surfaces, images the driver owns, and the one legitimate flip | presented frame matches the image |
 | **M3b** ✅ | Depth testing, depth writes, binary semaphores; `vkcube` runs | The pipeline state `vkcube` needs before it will draw | The nine-phase depth chain, and `vkcube` on screen |
-| **M4** | Fences, events, timestamps, queries | Correctness | sample suite runs |
+| **M3c** | Wayland surfaces (`VK_KHR_wayland_surface`) | WSI on a Wayland-only desktop, which several distributions ship as default | `vkcube` under Wayland, swapchain on a `wl_display` |
+| **M4** | Fences, events, timestamps, queries | Correctness and sync an indeterminate application assumes exists | sample suite runs |
+| **M5** | The smooth tier: per-draw state diffs, descriptor dirty-tracking, persistent buffers | Something close to 60 fps *for the supported subset* — see §6 | a real Vulkan 1.0-subset game at vsync on this machine |
+| **M6** | Windows: WGL context backend, ICD manifest placement, CI build | The same driver on the other half of desktop users | `vkcube` on Windows through WGL, or through ANGLE where WGL is not honest |
 
 M0 is done and was checked on the development machine (Intel HD 4400 / Mesa
 26.2.4): the loader negotiated ICD interface version 5 and `vulkaninfo --summary`
@@ -1109,8 +1112,90 @@ rendered into reads GL's undefined initial contents, which the test never
 exercises because a framebuffer that has not been rendered to has no honest
 contents to load.
 
-## 5. Non-goals
+## 5. Windows
+
+A Windows port is why the platform layer is a small, named seam rather than
+scattered EGL calls. What the port is concretely, and what it is not.
+
+- **The driver code does not move.** Everything from the object model down
+  through translation, memory, buffers, images, render passes and depth was
+  written against an `egl::` surface designed to be swapped. The port is: a WGL
+  backend that creates a context and loads its functions via `wglGetProcAddress`
+  (the same lazy-load pattern the EGL backend already uses internally, so the
+  function table itself moves untouched), the swapchain's present step replaced
+  by `SwapBuffers` on a window whose pixel format supports depth, and the ICD
+  manifest reachable through the loader's search paths.
+- **Where the manifest lands.** On Windows the loader finds ICDs by scanning
+  registry entries under `HKLM\SOFTWARE\Khronos\Vulkan\Drivers\` whose DWORD 0
+  values name each manifest JSON — or, simplest for Kniz, the same
+  `VK_DRIVER_FILES` / `VK_ICD_FILENAMES` environment variables the loader
+  honours on every platform. The Windows-specific delta is how the DLL exports
+  `vk_icdGetInstanceProcAddr` (`__declspec(dllexport)` under Vulkan's name) and
+  the manifest's `library_path` resolution, which stays manifest-relative
+  exactly as it is.
+- **The GL backend on Windows is the risk, not Vulkan.** Desktop GL on NVIDIA and
+  AMD is a real 4.x core driver; Intel's Windows GL is thin; some machines have
+  only Microsoft's stale GL 1.x shim, which cannot be Kniz's floor (it needs 4.5+
+  core for buffer objects, FBOs and shader objects). The fallback that *is*
+  portable is ANGLE — EGL over D3D11 — which is how Chrome ships OpenGL on
+  Windows. Kniz-on-ANGLE = Vulkan → GL → D3D11, one translation deeper than
+  DXVK's native Vulkan → D3D11; the honest statement is the same as on Linux,
+  doubled: Kniz is the way to run Vulkan **at all** on a machine whose only
+  working path is GL, never the way to race software that skips a link.
+- **DX owns the other niche.** This is worth saying once, plainly, because it is
+  the reason the Windows port will not be anyone's performance answer: on
+  Windows, Vulkan-on-GPU that skips native Vulkan is exactly what DXVK already
+  is, mature, and it does one translation instead of two. Kniz's Windows value is
+  the same as its Linux value — Vulkan *capability* on GL-only machines — with
+  the same ceiling.
+
+## 6. Performance: what the "smooth tier" takes
+
+"Smooth" is tier-shaped, not absolute. The honest decomposition of the goal that
+drove M5 into the roadmap above:
+
+- **What it applies to.** Vulkan 1.0 feature subsets — 2D games, mobile-range 3D,
+  emulator renderers with simple backends, Khronos samples beyond `vkcube`.
+  These use everything Kniz already owns: one render pass, one depth attachment,
+  uniform buffers, push constants, one or two textures, indexed draws.
+- **What dominates the per-draw cost, measured from the current code.** Every
+  draw re-applies the whole pipeline state and rebinds every descriptor —
+  recorded in M2b and M2d's remaining costs — and every buffer upload rides the
+  host mirror. None of it is free; together it is the reason a supported game
+  would stutter today even when nothing is refused. The rest of the frame has no
+  translation overhead, so this is where the budget is spent and this is where
+  it comes back.
+- **The plan, in the order it earns its keep.**
+  1. *Pipeline state diffing.* GL context state is already a mutable copy; put
+     the copy in the driver and apply only what changed since the last draw of
+     the previous pipeline. Most scenes bind the same pipeline for runs of
+     draws, and the jump from "all state" to "the delta" is the single largest
+     saving.
+  2. *Descriptor dirty-tracking.* Same shape as `sync_buffers_from_gl`: keep the
+     applied-on-GPU version of each descriptor set in the set object, rebind
+     only when a write or a different set touched it.
+  3. *Persistent-mapped GL buffers.* The host mirror exists because GL upload
+     required it; with `GL_MAP_PERSISTENT_BIT` the mirror and the GL object can
+     be one allocation, saving a full copy per submit for every buffer the CPU
+     wrote once and the GPU never changes.
+  4. *Draw batching on the IR.* Recorded draws that differ only in vertex counts
+     and offsets, sharing one buffer and one bound state, collapse at replay into
+     one set of bind calls with consecutive `glDrawArrays` — the command IR is an
+     intermediate representation, so this is a transform on it rather than a
+     rewrite of the replay.
+  5. *Program binary caching.* SPIRV-Cross output depends only on the SPIR-V and
+     the layout; persist the translated GLSL (and Mesa's program binary) keyed by
+     their hashes, so the second run of a game skips translation and compile
+     entirely.
+- **The gate that says "smooth" has been reached.** Not a synthetic benchmark:
+  one real Vulkan 1.0-subset game — choosable at the time — running at the
+  display's refresh rate on the development machine (a 2013 iGPU), with the frame
+  time distribution recorded rather than the peak claimed. Below that, the
+  release notes do not claim smoothness; that is the same conservatism §2 opened
+  with, applied one level down.
+
+## 7. Non-goals
 
 CTS conformance. Multi-queue correctness. Sparse resources. Timeline
 semaphores. Ray tracing and mesh shaders. Any claim of performance parity —
-see §1.
+see §1 — or of smoothness outside the tier §6 defines.

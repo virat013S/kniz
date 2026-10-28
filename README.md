@@ -107,8 +107,13 @@ are argued in [`docs/DESIGN.md`](docs/DESIGN.md):
 - `VK_PRESENT_MODE_MAILBOX_KHR` and `IMMEDIATE` — presentation is synchronous, so
   there is no queue to drop a frame from or to skip.
 
-Next is Wayland surfaces, which is what a Wayland-only session needs before the
-swapchain path works at all there.
+Next is Wayland surfaces (M3c), then the two things the roadmap now names
+explicitly because they are the point for games: **M5, the smooth tier** — per-draw
+state diffs, descriptor dirty-tracking, persistent buffers, program caching,
+converging on a real Vulkan 1.0-subset game at vsync on this 2013 iGPU — and
+**M6, Windows** (WGL or ANGLE contexts, registry/environment manifest
+placement), so the same honest driver runs there. Where "smooth" ends in both
+cases is written down in `docs/DESIGN.md` §5–§6 rather than implied.
 
 ## Building
 
