@@ -16,6 +16,19 @@ not present in the target API.
 The consequence: set expectations at *correctness for simple workloads*, not
 performance, and never parity with Zink.
 
+A related correction, stated once so it does not have to be re-derived: neither
+project upgrades anything, because an API is not where performance lives — the
+driver at the bottom is. Zink exists because GL drivers stopped being where
+investment goes, so it glues the old API onto the maintained Vulkan drivers.
+Kniz exists where the arrangement is reversed: machines with a capable GL
+driver and no Vulkan driver at all — Intel hardware below Broadwell, the Haswell
+GT2 of the development workstation among them — where the GL path is not the
+slow path but the fast *present* one. A Vulkan application on that machine has
+two options: no GPU at all, or Kniz borrowing the iris driver. The performance
+budget is therefore the translation, not the driver: shrink the per-draw
+overhead (§6) far enough and a supported tier game plays on borrowed GL as if
+the platform had shipped Vulkan.
+
 ## 2. The fidelity budget
 
 This table is the project's real constraint. Anything in the "Loss" column is
