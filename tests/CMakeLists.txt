@@ -94,9 +94,11 @@ add_test(NAME present
 set(kniz_test_environment
   "VK_ICD_FILENAMES=${CMAKE_BINARY_DIR}/src/kniz_icd.json;VK_DRIVER_FILES=${CMAKE_BINARY_DIR}/src/kniz_icd.json;KNIZ_LOG=2")
 
-set_tests_properties(lifecycle PROPERTIES ENVIRONMENT "${kniz_test_environment}")
-set_tests_properties(compute PROPERTIES ENVIRONMENT "${kniz_test_environment}")
-set_tests_properties(image PROPERTIES ENVIRONMENT "${kniz_test_environment}")
-set_tests_properties(draw PROPERTIES ENVIRONMENT "${kniz_test_environment}")
-set_tests_properties(uniform PROPERTIES ENVIRONMENT "${kniz_test_environment}")
-set_tests_properties(sampler PROPERTIES ENVIRONMENT "${kniz_test_environment}")
+# Applied to every test in this directory rather than listed one by one, because
+# listing them is a footgun that has already fired: the present test was added to
+# add_test() and not to the list here, so it ran against the machine's own Vulkan
+# driver.  It passed on a developer machine whose shell exported these variables
+# and failed in CI, which is the worst way round.  Asking the directory for its
+# tests means a new test cannot be forgotten.
+get_property(kniz_tests DIRECTORY PROPERTY TESTS)
+set_tests_properties(${kniz_tests} PROPERTIES ENVIRONMENT "${kniz_test_environment}")
