@@ -1193,6 +1193,19 @@ drove M5 into the roadmap above:
   time distribution recorded rather than the peak claimed. Below that, the
   release notes do not claim smoothness; that is the same conservatism §2 opened
   with, applied one level down.
+- **Which games that means, so the gate is choosable now.** Native Vulkan
+  renderers inside the supported subset: `vkQuake` and `vkQuake2` (open-source
+  id Tech 1/2 on Vulkan; the likely first gate), Croteam's `The Talos Principle`
+  (the first native Vulkan PC renderer off the shelf), GZDoom's Vulkan backend
+  (the widest content library; its dynamic-descriptor paths will probably meet
+  refusals, which is a finding either way). What it expressly does *not* mean,
+  and why: GTA V and Saints Row IV are the same confused example twice —
+  ordinary D3D11 games that reach Vulkan only as DXVK's translation output
+  inside Proton; running them over Kniz stacks `D3D11 → DXVK → Vulkan → Kniz →
+  GL` on a heavy world, and RDR2's switchable Vulkan renderer is a native path
+  that far exceeds anything this iGPU can hold at 60. The honest target is the
+  games that render Vulkan themselves, not the famous ones whose DXVK fame
+  makes them look Vulkan — the reason §1 opened with the DXVK caution.
 
 ## 7. Non-goals
 
