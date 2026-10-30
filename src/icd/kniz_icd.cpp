@@ -251,15 +251,18 @@ VKAPI_ATTR VkResult VKAPI_CALL EnumerateInstanceVersion(uint32_t* pApiVersion) {
 // anything that presents; without them the loader refuses to create an instance
 // for an application that enables them, which is the honest failure.
 //
-// Wayland and Xlib surfaces are not listed.  Both are a real change rather than
-// an alias: a GL context lives on one EGL display, so a Wayland surface needs the
-// context to have come up on Wayland and needs a wl_egl_window wrapped around the
-// application's wl_surface, which is the next milestone (see DESIGN.md §3.13).
-// Until then vkGetPhysicalDeviceSurfaceSupportKHR reports no support when the
-// context is not on X11, which is what an application should be checking.
+// Xlib surfaces are deliberately absent: like the Xcb entry they would be one
+// thin alias apart, but every surface type the driver accepts needs a GL
+// context that came up on that platform, and each accepted platform is an
+// honest commitment of code that answers for it.  Wayland is listed because
+// M3c made that commitment real: the loader defers an ICD's first contact with
+// a surface until the first WSI query, where the driver rebuilds its context on
+// the application's wl_display unless that would strand live window surfaces of
+// another kind (see the implementation and DESIGN.md §3.15).
 constexpr VkExtensionProperties kInstanceExtensions[] = {
     {"VK_KHR_surface", VK_KHR_SURFACE_SPEC_VERSION},
     {"VK_KHR_xcb_surface", kXcbSurfaceSpecVersion},
+    {"VK_KHR_wayland_surface", kWaylandSurfaceSpecVersion},
 };
 
 constexpr bool instance_extension_supported(const char* name) {
@@ -609,12 +612,20 @@ const Entry kEntries[] = {
     {"vkGetPhysicalDeviceSparseImageFormatProperties",
      as_entry(GetPhysicalDeviceSparseImageFormatProperties)},
 
-    // Surfaces and their queries.  The platform half is xcb, whose create info
-    // is declared in kniz_swapchain.h rather than by including an xcb header.
+    // Surfaces and their queries.  The platform halves are xcb and Wayland,
+    // whose create infos are declared in kniz_swapchain.h rather than by
+    // including a platform header.
     {"vkCreateXcbSurfaceKHR", as_entry(CreateXcbSurfaceKHR)},
+    {"vkCreateWaylandSurfaceKHR", as_entry(CreateWaylandSurfaceKHR)},
     {"vkDestroySurfaceKHR", as_entry(DestroySurfaceKHR)},
     {"vkGetPhysicalDeviceSurfaceSupportKHR",
      as_entry(GetPhysicalDeviceSurfaceSupportKHR)},
+    {"vkGetPhysicalDeviceXcbPresentationSupportKHR",
+     as_entry(GetPhysicalDeviceXcbPresentationSupportKHR)},
+    {"vkGetPhysicalDeviceXlibPresentationSupportKHR",
+     as_entry(GetPhysicalDeviceXlibPresentationSupportKHR)},
+    {"vkGetPhysicalDeviceWaylandPresentationSupportKHR",
+     as_entry(GetPhysicalDeviceWaylandPresentationSupportKHR)},
     {"vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
      as_entry(GetPhysicalDeviceSurfaceCapabilitiesKHR)},
     {"vkGetPhysicalDeviceSurfaceFormatsKHR",

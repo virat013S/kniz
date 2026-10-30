@@ -101,11 +101,21 @@ Working today:
 - `vkcube`, the canonical smoke test, runs and spins until closed — it had been
   the first application to demand depth and to find two real driver bugs along
   the way, both now fixed and pinned by the depth test below.
+- Wayland (M3c): the second window system. A `VK_KHR_wayland_surface` wraps the
+  application's own `wl_display`, because Wayland objects are per-connection and
+  nothing else can see them; the GL context migrates onto it at the first WSI
+  query, which the Vulkan loader schedules — deliberately — after
+  `vkCreateDevice`, so the migration gate is live window surfaces rather than
+  device existence. Verified by `tests/wayland.cpp`, which drives the compositor
+  through a dlopened `libwayland-client` with the xdg-shell interfaces
+  hand-declared, and by `vkcube --wsi wayland`. One window system per context:
+  a Wayland surface that arrives after an X11 window surface exists is refused
+  with the reason, never quietly broken under the move.
 
 Not implemented: the stencil test, the depth bounds test, depth clamping and
 depth bias, blending, multisampling, instancing, geometry and tessellation
 stages, dynamic uniform buffers, comparison samplers, anisotropic filtering, mip
-levels above 0, timeline semaphores, Wayland surfaces, and every swapchain format
+levels above 0, timeline semaphores, and every swapchain format
 but `VK_FORMAT_R8G8B8A8_UNORM`. Each is refused with a specific
 error at the point the application reveals it needs one, rather than accepted and
 silently ignored. Three refusals are permanent rather than pending, and all three
@@ -118,7 +128,9 @@ are argued in [`docs/DESIGN.md`](docs/DESIGN.md):
 - `VK_PRESENT_MODE_MAILBOX_KHR` and `IMMEDIATE` — presentation is synchronous, so
   there is no queue to drop a frame from or to skip.
 
-Next is Wayland surfaces (M3c), then the two things the roadmap now names
+Next is M4 — fences, events, timestamps and queries, the correctness and
+synchronisation an indeterminate application assumes is there — and then the two
+things the roadmap now names
 explicitly because they are the point for games: **M5, the smooth tier** — per-draw
 state diffs, descriptor dirty-tracking, persistent buffers, program caching,
 converging on a real Vulkan 1.0-subset game at vsync on this 2013 iGPU — and
@@ -235,7 +247,7 @@ What is implemented
   push constants                           yes  M2c (lowered onto a uniform buffer)
   samplers                                 yes  M2d (GL sampler objects)
   textures in shaders                      yes  M2d (combined or separate)
-  swapchain / window presentation          yes  M3 (X11 windows, FIFO)
+  swapchain / window presentation          yes  M3/M3c (X11 and Wayland windows, FIFO)
   acquire / present / image cycling        yes  M3
   depth attachment, depth test/write/compare yes  M3b (stencil and depth bounds refused)
   binary semaphores                        yes  M3b (no state: submission and present are synchronous)
@@ -247,7 +259,7 @@ What is implemented
   push constants: non-std140 packing       no   OpenGL cannot express it, see DESIGN.md
   comparison samplers, anisotropy          no   M2d refused on purpose
   sampling mip levels above 0              no   only level 0 is ever written, see DESIGN.md
-  Wayland surfaces                         no   the EGL context is on X11, see DESIGN.md
+  Wayland surfaces                         yes  M3c (wl_egl_window; the context is on the application's wl_display)
   sRGB and BGRA swapchain formats          no   M3 refused on purpose
   MAILBOX and IMMEDIATE present modes      no   presentation is synchronous, see DESIGN.md
   fences, queries, timestamps              no   M4
@@ -264,8 +276,9 @@ What is implemented
   declared them.  Textures are sampled in both compute and graphics shaders,
   through combined image samplers and through a separate image and sampler,
   with the filter and address modes coming from the sampler object rather
-  than from the image.  A swapchain is created on an X11 window, drawn into
-  through an ordinary render pass, and presented: the frame that is about to
+  than from the image.  Swapchains are created on X11 windows and, through
+  the wayland test, on Wayland ones.  Each is drawn into via an ordinary
+  render pass and presented: the frame that is about to
   be shown is read back and compared against the image, so the present path
   is checked rather than looked at.  A D16 depth attachment can be cleared,
   tested with the pipeline's compare operation, written and loaded across a
@@ -276,7 +289,7 @@ What is implemented
   depth bias, blending, multisampling, instancing, geometry and tessellation
   stages, more than one subpass, input attachments, dynamic uniform buffers,
   comparison samplers, anisotropic filtering, mip levels above 0, timeline
-  semaphores, Wayland surfaces, and every swapchain format but
+  semaphores, and every swapchain format but
   R8G8B8A8_UNORM.
   Programs that create a device, ask questions about it, run a compute shader
   over buffers, move image contents, draw depth-tested geometry textured from
@@ -324,7 +337,7 @@ Set `KNIZ_LOG=0..4` (`error`..`trace`) to control logging; the default is `2`.
 ctest --test-dir build --output-on-failure
 ```
 
-Eight tests, all driven through the **real Vulkan loader** rather than by calling
+Nine tests, all driven through the **real Vulkan loader** rather than by calling
 the ICD directly. That is deliberate: the most damaging class of ICD bug — a
 dispatchable object that does not reserve its first word for the loader's
 dispatch pointer — is invisible when the ICD is called directly, and produces a
@@ -441,12 +454,29 @@ See the note in [`docs/DESIGN.md`](docs/DESIGN.md).
   stencil test and the depth bounds test in a pipeline; and a timeline semaphore
   at creation.
 
+- `wayland` — the Wayland surface path and the Wayland context migration (M3c).
+  It dlopens `libwayland-client.so.0` — the build gains no Wayland dependency,
+  and a machine without a running compositor, an older Wayland (pre-1.22) or no
+  `WAYLAND_DISPLAY` skips the test instead of failing it — speaks the core
+  protocol through the library's interface symbols, and hand-declares the
+  xdg-shell ones, whose request opcodes and argument signatures it spells out
+  from the protocol XML (including two quirks that cost the first build two
+  crashes: every `new_id` argument consumes a vararg slot, and
+  `wl_registry.bind`'s wire order is the historical `usun`). A real window is
+  mapped through the xdg handshake, and then the same battery as `present` runs
+  on it: the refusals, the triangle compared pixel for pixel both from the
+  swapchain image and from the connected present dump, acquisition round robin,
+  the bogus-index refusal, and a second swapchain that scales the drawable down,
+  which exercises `wl_egl_window_resize`. An unmapped-role or a half-migrated
+  context would fail a named check rather than misbehave.
+
 The shaders the tests use are checked in twice: as GLSL, and as the compiled
 SPIR-V an application would actually submit. The command that regenerates each
 SPIR-V file is recorded at the top of the GLSL it came from
 (`tests/shaders/scale.comp`, the four that `draw` uses, the four that `uniform`
-uses, the four that `sampler` uses, the two that `present` reuses from `draw` and
-the two that `depth` uses), and the compiled forms are committed so that the test
+uses, the four that `sampler` uses, the two that `present` and `wayland` reuse
+from `draw` and the two that `depth` uses), and the compiled forms are committed
+so that the test
 suite does not depend on `glslangValidator` being installed.
 
 ## Layout

@@ -28,6 +28,13 @@ namespace kniz {
 // extension's published interface and has not changed since 2016.
 inline constexpr uint32_t kXcbSurfaceSpecVersion = 6;
 
+// VK_KHR_wayland_surface's current promoted revision (6) and structure type,
+// spelled out here for the same reason the xcb one is: no platform header is
+// included anywhere in this driver, the platform guards in <vulkan/vulkan.h>
+// would have to be switched on, and a hand-written constant the extension spec
+// fixes is smaller than that.
+inline constexpr uint32_t kWaylandSurfaceSpecVersion = 6;
+
 // The device extensions this file implements.  vkCreateDevice uses it to accept
 // them quietly while still warning about everything else it cannot do.
 bool swapchain_extension_supported(const char* name);
@@ -43,8 +50,23 @@ struct XcbSurfaceCreateInfo {
   uint32_t window;   // xcb_window_t, a 32-bit XID
 };
 
+// VK_KHR_wayland_surface's create info, same reason and same published ABI.
+// Wayland hands over pointers rather than identifiers, and they belong to the
+// application's own connection -- which is what makes a Wayland context a
+// matter of the application's wl_display and not our own connection.
+struct WaylandSurfaceCreateInfo {
+  VkStructureType sType;
+  const void* pNext;
+  VkFlags flags;
+  void* display;   // wl_display*, the application's connection
+  void* surface;   // wl_surface*, the application's window shell
+};
+
 VKAPI_ATTR VkResult VKAPI_CALL CreateXcbSurfaceKHR(
     VkInstance instance, const XcbSurfaceCreateInfo* pCreateInfo,
+    const VkAllocationCallbacks* pAllocator, VkSurfaceKHR* pSurface);
+VKAPI_ATTR VkResult VKAPI_CALL CreateWaylandSurfaceKHR(
+    VkInstance instance, const WaylandSurfaceCreateInfo* pCreateInfo,
     const VkAllocationCallbacks* pAllocator, VkSurfaceKHR* pSurface);
 VKAPI_ATTR void VKAPI_CALL DestroySurfaceKHR(
     VkInstance instance, VkSurfaceKHR surface,
@@ -52,6 +74,15 @@ VKAPI_ATTR void VKAPI_CALL DestroySurfaceKHR(
 VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceSupportKHR(
     VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex,
     VkSurfaceKHR surface, VkBool32* pSupported);
+VKAPI_ATTR VkBool32 VKAPI_CALL GetPhysicalDeviceXcbPresentationSupportKHR(
+    VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex,
+    const void* connection, uint32_t visual);
+VKAPI_ATTR VkBool32 VKAPI_CALL GetPhysicalDeviceXlibPresentationSupportKHR(
+    VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex,
+    const void* display, uint32_t screen);
+VKAPI_ATTR VkBool32 VKAPI_CALL GetPhysicalDeviceWaylandPresentationSupportKHR(
+    VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex,
+    const void* display);
 VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceCapabilitiesKHR(
     VkPhysicalDevice physicalDevice, VkSurfaceKHR surface,
     VkSurfaceCapabilitiesKHR* pSurfaceCapabilities);

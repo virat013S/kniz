@@ -418,7 +418,7 @@ int main(int argc, char** argv) {
   capability("samplers", true, "M2d (GL sampler objects)");
   capability("textures in shaders", true, "M2d (combined or separate)");
   capability("swapchain / window presentation", true,
-             "M3 (X11 windows, FIFO)");
+             "M3/M3c (X11 and Wayland windows, FIFO)");
   capability("acquire / present / image cycling", true, "M3");
   capability("depth attachment, depth test/write/compare", true,
              "M3b (stencil and depth bounds refused)");
@@ -436,8 +436,9 @@ int main(int argc, char** argv) {
              "M2d refused on purpose");
   capability("sampling mip levels above 0", false,
              "only level 0 is ever written, see DESIGN.md");
-  capability("Wayland surfaces", false,
-             "the EGL context is on X11, see DESIGN.md");
+  capability("Wayland surfaces", true,
+             "M3c (wl_egl_window; the context is on the application's "
+             "wl_display)");
   capability("sRGB and BGRA swapchain formats", false,
              "M3 refused on purpose");
   capability("MAILBOX and IMMEDIATE present modes", false,
@@ -457,8 +458,9 @@ int main(int argc, char** argv) {
       "  declared them.  Textures are sampled in both compute and graphics shaders,\n"
       "  through combined image samplers and through a separate image and sampler,\n"
       "  with the filter and address modes coming from the sampler object rather\n"
-      "  than from the image.  A swapchain is created on an X11 window, drawn into\n"
-      "  through an ordinary render pass, and presented: the frame that is about to\n"
+      "  than from the image.  Swapchains are created on X11 windows and, through\n"
+      "  the wayland test, on Wayland ones.  Each is drawn into via an ordinary\n"
+      "  render pass and presented: the frame that is about to\n"
       "  be shown is read back and compared against the image, so the present path\n"
       "  is checked rather than looked at.  A D16 depth attachment can be cleared,\n"
       "  tested with the pipeline's compare operation, written and loaded across a\n"
@@ -468,7 +470,7 @@ int main(int argc, char** argv) {
       "  depth bias, blending, multisampling, instancing, geometry and tessellation\n"
       "  stages, more than one subpass, input attachments, dynamic uniform buffers,\n"
       "  comparison samplers, anisotropic filtering, mip levels above 0, timeline\n"
-      "  semaphores, Wayland surfaces, and every swapchain format but\n"
+      "  semaphores, and every swapchain format but\n"
       "  R8G8B8A8_UNORM.\n"
       "  Programs that create a device, ask questions about it, run a compute shader\n"
       "  over buffers, move image contents, draw depth-tested geometry textured from\n"

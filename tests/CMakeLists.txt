@@ -64,6 +64,15 @@ add_executable(kniz_depth depth.cpp)
 target_link_libraries(kniz_depth PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
 target_compile_options(kniz_depth PRIVATE -Wall -Wextra)
 
+# The M3c milestone test: presentation on Wayland.  It needs a compositor, which
+# it talks to through libwayland-client opened with dlopen -- so like the present
+# test, the build gains no Wayland dependency, and a machine with no compositor
+# (a CI runner, for one) skips the test rather than failing it.
+add_executable(kniz_wayland wayland.cpp)
+
+target_link_libraries(kniz_wayland PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+target_compile_options(kniz_wayland PRIVATE -Wall -Wextra)
+
 if(KNIZ_WERROR)
   target_compile_options(kniz_lifecycle PRIVATE -Werror)
   target_compile_options(kniz_compute PRIVATE -Werror)
@@ -73,6 +82,7 @@ if(KNIZ_WERROR)
   target_compile_options(kniz_sampler PRIVATE -Werror)
   target_compile_options(kniz_present PRIVATE -Werror)
   target_compile_options(kniz_depth PRIVATE -Werror)
+  target_compile_options(kniz_wayland PRIVATE -Werror)
 endif()
 
 add_test(NAME lifecycle COMMAND kniz_lifecycle)
@@ -89,6 +99,8 @@ add_test(NAME present
   COMMAND kniz_present "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
 add_test(NAME depth
   COMMAND kniz_depth "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
+add_test(NAME wayland
+  COMMAND kniz_wayland "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
 
 # The loader resolves the manifest's library_path relative to the manifest's own
 # directory, so build/src is where both the library and its manifest live:

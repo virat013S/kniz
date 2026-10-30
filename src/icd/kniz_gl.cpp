@@ -11,6 +11,9 @@
 #include <cstdlib>
 #include <cstring>
 
+#include <cstdint>
+#include <vector>
+
 namespace kniz::gl {
 
 Functions f;
@@ -24,6 +27,19 @@ EGLContext g_context = EGL_NO_CONTEXT;
 bool g_surfaceless = false;
 bool g_window_capable = false;
 WindowPlatform g_platform = WindowPlatform::None;
+// The wl_display the context's EGL display was built on, when it was built on
+// the Wayland platform.  A Wayland EGL display draws to windows that belong to
+// the connection it was built on, so this pointer is what decides whether a
+// surface's display can be served by the context as it stands.
+const void* g_wayland_display = nullptr;
+
+// Live X11 window surfaces.  Wayland surfaces are counted by
+// g_wayland_pairings.size(); X11 windows need a tally of their own (an XID has
+// no window to pair with: XIDs are server-wide, so the EGL surface alone is the
+// whole of the state).  Rebuilding the context on another platform strands
+// every live EGLSurface of the old one, so a rebuild is allowed only while both
+// counts are zero.
+int g_x11_windows = 0;
 
 ContextInfo g_info;
 bool g_attempted = false;
@@ -150,6 +166,90 @@ bool query_context_info() {
 
   parse_version(version, g_info);
   return true;
+}
+
+// ---------------------------------------------------------------------------
+// libwayland-egl
+//
+// A Wayland window surface is a wl_egl_window wrapped around the application's
+// wl_surface; EGL's Wayland platform draws to that window, never to the
+// wl_surface itself.  The three functions that manage the wrapper live in
+// libwayland-egl, and Kniz opens it with dlopen rather than link against it:
+// the driver's build has no Wayland requirement, and a machine that never
+// touches Wayland never loads the library.  This mirrors how the loader itself
+// and every test binary treat their platform libraries.
+//
+// The three functions have been stable in name and signature for as long as
+// the library has existed, which is as much of an ABI contract as dlopen needs.
+// ---------------------------------------------------------------------------
+
+struct WaylandEglProcs {
+  void* (*create)(void* surface, int width, int height);
+  void (*resize)(void* window, int width, int height, int dx, int dy);
+  void (*destroy)(void* window);
+};
+
+WaylandEglProcs g_wayland_egl{};
+bool g_wayland_egl_loaded = false;
+
+bool load_wayland_egl() {
+  if (g_wayland_egl_loaded)
+    return g_wayland_egl.create != nullptr;
+  g_wayland_egl_loaded = true;
+
+  void* library = dlopen("libwayland-egl.so.1", RTLD_NOW | RTLD_LOCAL);
+  if (library == nullptr) {
+    KNIZ_ERR("libwayland-egl.so.1 could not be loaded (%s); Wayland surfaces "
+             "need it to turn a wl_surface into something EGL can draw to",
+             dlerror());
+    return false;
+  }
+  // Resolved from the handle directly: try_load_proc's routes are
+  // eglGetProcAddress and dlsym(RTLD_DEFAULT), and neither of those can reach
+  // a library opened with RTLD_LOCAL.
+  const auto resolve = [library](void* slot, size_t slot_size,
+                                 const char* name) {
+    void* symbol = dlsym(library, name);
+    if (symbol == nullptr) {
+      KNIZ_ERR("libwayland-egl has no %s", name);
+      return false;
+    }
+    if (slot_size != sizeof(symbol)) {
+      KNIZ_ERR("size mismatch resolving %s", name);
+      return false;
+    }
+    std::memcpy(slot, &symbol, slot_size);
+    return true;
+  };
+  bool ok = true;
+  ok &= resolve(&g_wayland_egl.create, sizeof(g_wayland_egl.create),
+                "wl_egl_window_create");
+  ok &= resolve(&g_wayland_egl.resize, sizeof(g_wayland_egl.resize),
+                "wl_egl_window_resize");
+  ok &= resolve(&g_wayland_egl.destroy, sizeof(g_wayland_egl.destroy),
+                "wl_egl_window_destroy");
+  return ok;
+}
+
+// The EGL surface and its wl_egl_window travel together: the window is created
+// before the EGL surface and has to be destroyed after it, and every operation
+// that either changes the window's size or tears it down needs to find the
+// window again from the surface alone.  Surfaces number in the ones, so a
+// linear scan is the whole of the cost.
+struct WindowPairing {
+  EGLSurface egl_surface;
+  void* wayland_window;
+};
+
+std::vector<WindowPairing> g_wayland_pairings;
+
+WindowPairing* find_pairing(WindowSurface surface) {
+  const EGLSurface egl_surface = reinterpret_cast<EGLSurface>(surface);
+  for (WindowPairing& pairing : g_wayland_pairings) {
+    if (pairing.egl_surface == egl_surface)
+      return &pairing;
+  }
+  return nullptr;
 }
 
 }  // namespace
@@ -332,6 +432,7 @@ WindowSurface create_window_surface(uint64_t native_window) {
     KNIZ_ERR("eglCreateWindowSurface failed (0x%04x)", eglGetError());
     return nullptr;
   }
+  ++g_x11_windows;
 
   // The swap interval is the whole of what FIFO means here: the presentation
   // queue is the compositor's, and an interval of 1 is what makes eglSwapBuffers
@@ -360,6 +461,25 @@ void destroy_window_surface(WindowSurface surface) {
   // GL call after this one assumes it has.
   eglMakeCurrent(g_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
   eglDestroySurface(g_display, egl_surface);
+  // If this surface went through a wl_egl_window, destroy that too, after the
+  // EGL surface: Mesa's Wayland platform keeps a reference to the window for
+  // as long as the EGL surface lives.
+  if (WindowPairing* pairing = find_pairing(surface)) {
+    if (pairing->wayland_window != nullptr && g_wayland_egl.destroy != nullptr)
+      g_wayland_egl.destroy(pairing->wayland_window);
+    for (size_t i = 0; i < g_wayland_pairings.size(); ++i) {
+      if (&g_wayland_pairings[i] == pairing) {
+        g_wayland_pairings.erase(g_wayland_pairings.begin() +
+                                 static_cast<std::ptrdiff_t>(i));
+        break;
+      }
+    }
+    KNIZ_DBG("wl_egl_window destroyed with its EGL surface");
+  } else {
+    // An X11 window surface: no pairing, but the drawable's tally still owes
+    // one.
+    --g_x11_windows;
+  }
   bind_headless_surface();
 }
 
@@ -409,6 +529,87 @@ bool swap_window_surface(WindowSurface surface) {
   return true;
 }
 
+WindowSurface create_window_surface_wayland(const void* wl_surface,
+                                            int width, int height) {
+  if (wl_surface == nullptr || width <= 0 || height <= 0) {
+    KNIZ_ERR("a Wayland window surface needs a wl_surface and a positive size");
+    return nullptr;
+  }
+  if (g_display == EGL_NO_DISPLAY || g_config == nullptr ||
+      g_context == EGL_NO_CONTEXT) {
+    KNIZ_ERR("cannot create a window surface: there is no OpenGL context");
+    return nullptr;
+  }
+  if (g_platform != WindowPlatform::Wayland) {
+    // The reversed mirror of the X11 refusal: a wl_surface belongs to a
+    // wl_display connection, and this context's EGL display draws windows only
+    // on the connection it was built on.
+    KNIZ_ERR("cannot create a Wayland window surface: the OpenGL context is "
+             "not on the Wayland platform%s",
+             g_platform == WindowPlatform::X11 ? " (it is on X11)" : "");
+    return nullptr;
+  }
+  if (!g_window_capable) {
+    KNIZ_ERR("cannot create a window surface: this OpenGL context has no "
+             "config that supports windows");
+    return nullptr;
+  }
+  if (!load_wayland_egl())
+    return nullptr;
+
+  // Wrap the application's wl_surface in a wl_egl_window of the swapchain's
+  // extent.  The wrap is what EGL wants; the wl_surface itself is not a
+  // drawable.
+  void* wayland_window =
+      g_wayland_egl.create(const_cast<void*>(wl_surface), width, height);
+  if (wayland_window == nullptr) {
+    KNIZ_ERR("wl_egl_window_create failed");
+    return nullptr;
+  }
+
+  // EGLNativeWindowType is an unsigned long in the X11 flavoured headers this
+  // build resolves against; a pointer passes through it unchanged on every
+  // platform this driver targets, and the Wayland EGL display is defined to
+  // read it as a wl_egl_window*.
+  const EGLint attribs[] = {EGL_NONE};
+  EGLSurface egl_surface = eglCreateWindowSurface(
+      g_display, g_config,
+      reinterpret_cast<EGLNativeWindowType>(wayland_window), attribs);
+  if (egl_surface == EGL_NO_SURFACE) {
+    KNIZ_ERR("eglCreateWindowSurface failed for the wl_egl_window (0x%04x)",
+             eglGetError());
+    g_wayland_egl.destroy(wayland_window);
+    return nullptr;
+  }
+  g_wayland_pairings.push_back({egl_surface, wayland_window});
+
+  const WindowSurface handle = reinterpret_cast<WindowSurface>(egl_surface);
+  if (bind_window_surface(handle)) {
+    // Interval 0, deliberately: swap interval 1 waits for the compositor's
+    // frame callback, which a surface that is not yet mapped may never issue,
+    // and FIFO presentation here means "the compositor decides the pace",
+    // which on Wayland the compositor does regardless of the interval.  The
+    // interval is what makes X11 eglSwapBuffers wait; dropping it does not
+    // make Wayland presents tear, since on Wayland the buffer the compositor
+    // is showing is never the one the application is drawing into.
+    eglSwapInterval(g_display, 0);
+    bind_headless_surface();
+  }
+
+  KNIZ_DBG("window surface created for wl_surface %p at %dx%d", wl_surface,
+           width, height);
+  return handle;
+}
+
+void window_surface_resize_wayland(WindowSurface surface, int width,
+                                   int height) {
+  if (surface == nullptr || !load_wayland_egl())
+    return;
+  if (WindowPairing* pairing = find_pairing(surface)) {
+    g_wayland_egl.resize(pairing->wayland_window, width, height, 0, 0);
+  }
+}
+
 bool create_headless() {
   if (g_attempted)
     return g_ok;
@@ -433,10 +634,11 @@ bool create_headless() {
   // which is derived from the environment: with both WAYLAND_DISPLAY and
   // DISPLAY set -- the normal shape of a Wayland desktop running XWayland -- it
   // picks Wayland, and then an X11 window handle cannot be presented to at all.
-  // X11 is asked for first because it is the platform presentation currently
-  // supports, and it is reachable on both an X11 desktop and a Wayland one.
-  // Wayland is the next milestone's platform, and its absence is reported
-  // rather than worked around.
+  // Which platform the headless context starts on is a starting choice, not a
+  // commitment: X11 is asked for first because it is reachable on both an X11
+  // desktop and a Wayland one (through XWayland), and Wayland surfaces move
+  // the context over when the application asks for them (§3.15).  Platforms
+  // whose extension is missing are reported rather than worked around.
 #if defined(EGL_PLATFORM_X11_KHR)
   if (std::getenv("DISPLAY") != nullptr &&
       has_client_extension("EGL_EXT_platform_x11")) {
@@ -636,6 +838,17 @@ bool bring_up(EGLDisplay display, bool wants_surface, const char* label) {
 }
 
 void release() {
+  // The wl_egl_windows that belong to Wayland window surfaces are destroyed
+  // here as well: release() means the whole context is going away, and every
+  // EGL surface in the pairings dies with its display.  Doing this before
+  // eglTerminate keeps the order -- EGL surface first, wl_egl_window after --
+  // that also holds when surfaces are destroyed one at a time.
+  for (const WindowPairing& pairing : g_wayland_pairings) {
+    if (pairing.wayland_window != nullptr && g_wayland_egl.destroy != nullptr)
+      g_wayland_egl.destroy(pairing.wayland_window);
+  }
+  g_wayland_pairings.clear();
+
   if (g_display != EGL_NO_DISPLAY) {
     eglMakeCurrent(g_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
     if (g_context != EGL_NO_CONTEXT)
@@ -652,6 +865,7 @@ void release() {
   g_surfaceless = false;
   g_window_capable = false;
   g_platform = WindowPlatform::None;
+  g_wayland_display = nullptr;
 }
 
 }  // namespace
@@ -663,6 +877,83 @@ void destroy() {
   g_attempted = false;
   f = Functions{};
 }
+
+// ---------------------------------------------------------------------------
+// Bringing the context up on an application's Wayland connection
+// ---------------------------------------------------------------------------
+
+bool wayland_context_matches(const void* wl_display) {
+  return g_display != EGL_NO_DISPLAY && g_platform == WindowPlatform::Wayland &&
+         g_wayland_display == wl_display;
+}
+
+bool create_on_wayland(const void* wl_display) {
+  if (wl_display == nullptr) {
+    KNIZ_ERR("a Wayland surface needs both a wl_display and a wl_surface");
+    return false;
+  }
+#if defined(EGL_PLATFORM_WAYLAND_KHR)
+  if (g_display != EGL_NO_DISPLAY) {
+    KNIZ_ERR("the OpenGL context is already up; a Wayland surface the context "
+             "was not built on needs migrate_to_wayland, and that is only "
+             "possible before anything has been drawn");
+    return false;
+  }
+  if (!has_client_extension("EGL_EXT_platform_wayland")) {
+    KNIZ_ERR("this EGL has no Wayland platform support (EGL_EXT_platform_"
+             "wayland absent), so a wl_display cannot become an EGL display");
+    return false;
+  }
+  if (!load_wayland_egl())
+    return false;
+
+  // The application's wl_display is passed straight through: libEGL expects
+  // the client's own display pointer for the Wayland platform.
+  const EGLDisplay display = eglGetPlatformDisplay(
+      EGL_PLATFORM_WAYLAND_KHR, const_cast<void*>(wl_display), nullptr);
+  if (bring_up(display, true, "Wayland platform")) {
+    if (finish_setup(WindowPlatform::Wayland)) {
+      g_wayland_display = wl_display;
+      KNIZ_DBG("OpenGL context is up on the application's wl_display (Wayland "
+               "platform)");
+      return true;
+    }
+    KNIZ_ERR("OpenGL context came up but could not be used (Wayland platform)");
+    release();
+    return false;
+  }
+  return false;
+#else
+  KNIZ_ERR("built against headers without EGL_PLATFORM_WAYLAND_KHR; Wayland "
+           "surfaces are not available in this build");
+  return false;
+#endif
+}
+
+bool migrate_to_wayland(const void* wl_display) {
+  // Deliberately the same entry point nothing else may call: migration is the
+  // one sanctioned way to move the context between window systems, and it is
+  // only reachable while no live window surface depends on the current
+  // platform, which the caller checks with can_migrate_to_wayland.
+  release();
+  if (create_on_wayland(wl_display)) {
+    KNIZ_DBG("the OpenGL context was rebuilt on the application's wl_display");
+    return true;
+  }
+  return false;
+}
+
+bool can_migrate_to_wayland(const void* wl_display) {
+  // With a live window surface of some other platform the move strands its
+  // drawable, so it is not a mere rebuild of an idle context any more.  The
+  // tally counts X11 drawables; Wayland pairings only exist for the display
+  // the context currently serves, so their presence alone bars any move.  The
+  // wl_display argument is part of the question for symmetry with the other
+  // Wayland entry points, though its answer is already decided here.
+  (void)wl_display;
+  return g_x11_windows == 0 && g_wayland_pairings.empty();
+}
+
 
 namespace {
 
@@ -818,17 +1109,22 @@ bool finish_setup(WindowPlatform platform) {
               g_info.major, g_info.minor);
 
   // A window surface needs both a config that supports windows and a display
-  // whose platform the surface handle belongs to.
+  // whose platform the surface handle belongs to.  Which platforms count is
+  // what the swapchain layer answers for: X11 windows on the X11 platform,
+  // Wayland windows on the Wayland platform (§3.15).
   g_info.window_capable = g_window_capable && g_info.render_capable &&
-                          g_platform == WindowPlatform::X11;
+                          (g_platform == WindowPlatform::X11 ||
+                           g_platform == WindowPlatform::Wayland);
   if (g_info.window_capable)
-    KNIZ_INFO("presentation available: X11 windows, through EGL on the X11 "
-              "platform");
+    KNIZ_INFO("presentation available: %s windows, through EGL on the %s "
+              "platform",
+              g_platform == WindowPlatform::X11 ? "X11" : "Wayland",
+              g_platform == WindowPlatform::X11 ? "X11" : "Wayland");
   else
     KNIZ_INFO("presentation is unavailable: %s",
               g_platform == WindowPlatform::Wayland
-                  ? "the context is on Wayland, and Wayland surfaces are the "
-                    "next milestone"
+                  ? "the context is on Wayland, and this EGL cannot make "
+                    "window surfaces there"
                   : g_platform == WindowPlatform::None
                         ? "there is no window system (a surfaceless context)"
                         : "this EGL display cannot create a window surface");

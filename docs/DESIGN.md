@@ -59,7 +59,7 @@ work we can do; anything in the "Lost" column is unfixable.
 | `VkImage` layout + barriers | none; implicit | Mostly harmless; emit `glMemoryBarrier` where coherence matters |
 | `VkSurfaceKHR`, `VkSwapchainKHR` | an EGL window surface plus a list of GL textures | **Emulated** — GL cannot make a texture a window's front buffer, so presentation is a draw from one to the other (§3.13) |
 | `vkQueuePresentKHR` | a textured full-screen triangle, then `eglSwapBuffers` | Good for one format and FIFO; synchronous, so there is no queue to drop or skip |
-| Surfaces on a second window system | `wl_egl_window` for Wayland | Expressible, not implemented — a GL context lives on one EGL display, so the platform is fixed when the context is created (§3.13) |
+| Surfaces on a second window system | `wl_egl_window` for Wayland; the context rebuilds on the application's `wl_display` while no live window surface depends on the old platform (§3.15) | Implemented in M3c, with one window system per context |
 | Fences, binary semaphores, events | `GLSync` / synchronous replay | Approximate |
 | Timeline semaphores | none | **Lost** — needs an emulation layer |
 | `VkDeviceMemory` heaps, types, `vkMapMemory` | none | **Faked** — shadow object + lazy GL allocation |
@@ -698,6 +698,131 @@ is synchronous and their only legal observable state window is empty.
 `vkCreateSemaphore` with a timeline type is refused at creation, and a timeline
 semaphore is one of §7's non-goals.
 
+### 3.15 Wayland surfaces
+
+A Wayland surface is the second window system Kniz presents through
+(`VK_KHR_wayland_surface`, M3c), and it is the one whose constraints shape the
+GL side the most, because Wayland objects are per-connection: a `wl_surface`
+made on the application's `wl_display` is invisible to any other connection,
+and EGL's Wayland platform draws to a window only through the same connection
+that owns it. X11 is the other way round — XIDs are server-wide, which is why
+§3.13's window surface can be built on an EGL connection Kniz opened itself.
+So the Wayland context is built on the application's own `wl_display`, via
+`eglGetPlatformDisplay(EGL_PLATFORM_WAYLAND_KHR, display)`, and a Wayland
+surface joins a context that is already on that display or moves everything
+there.
+
+**The loader defers the ICD's first sight of a surface.** The plan had
+`vkCreateWaylandSurfaceKHR` as the moment the context migrates: applications
+create their surface before their device (vkcube among them), so a migration
+there happens while the context owns nothing. The Vulkan loader no longer
+works that way. `vkCreateWaylandSurfaceKHR` stops at the loader, which records
+the create info and returns its own wrapper without calling a single ICD; the
+per-ICD surface is created lazily by `wsi_unwrap_icd_surface` at the first WSI
+query — surface support, capabilities, formats — and every real application
+runs those after `vkCreateDevice`. So the migration gate cannot be device
+existence, and it never was the right gate: what a context rebuild strands is
+its live window surfaces, not its devices. GL objects a Vulkan application owns
+(buffers, textures, pipelines) are born inside the entry points that follow an
+ICD-level surface reaching the driver — swapchain creation most of all — so
+whatever the call sequence, the first WSI query strands nothing, and the gate
+is the count of live window surfaces in the other window system
+(`g_x11_windows`, `g_wayland_pairings`): migrate while both are zero, refuse
+with the reason otherwise. One window system per context is the rule, stated
+because it is now enforced in code rather than by geography.
+
+The same discovery moved the device's own GL state out of `vkCreateDevice`:
+the push constant buffer was created there, and a buffer created on the
+context that migration replaces is a name without an object on the new one
+(Mesa answered `BufferSubData` with `GL_INVALID_VALUE`, and the flag sat in the
+error queue until the first replay read it, which made its origin a puzzle).
+GL objects a device owns are now born at the first submission, on whatever
+context is current then — which, on Wayland, is the application's.
+
+**A Wayland drawable is `wl_egl_window` around the `wl_surface`.** The window
+is created when the first swapchain needs it, with the swapchain's extent —
+there is no drawable before that, because `wl_egl_window_create` needs a size —
+and it lives in a pairing table next to the EGL surface it backs, because the
+classic teardown trap is order-dependent: `eglDestroySurface` before
+`wl_egl_window_destroy`, since Mesa's Wayland platform keeps a reference to the
+window for as long as the EGL surface lives. A replacement swapchain with
+different extents calls `wl_egl_window_resize` on the same pair, tracked by
+`Surface::wayland_extent`, which is what makes §3.13's scaling test work on
+Wayland without a second drawable. `libwayland-egl.so.1` is dlopen'd, like
+everything else Kniz does not depend on at link time.
+
+**Swap interval 0, deliberately.** On X11, present mode FIFO is implemented by
+swap interval 1: `eglSwapBuffers` waits for the compositor's "next frame is
+scanned out" event, which is what makes present synchronous (§3.13). On
+Wayland that same interval waits for the compositor's frame callback, which a
+surface that is not yet mapped may never issue — a present on a minimised
+window becomes a deadlock. Interval 0 it is: on Wayland the compositor paces
+the queue regardless (it has to; an application is never drawing into the
+buffer the compositor is showing), so FIFO's guarantee changes owner without
+changing meaning, and the deadlock fails to happen.
+
+**Testing it means speaking Wayland without headers.** `tests/wayland.cpp`
+dlopens `libwayland-client.so.0` and uses `wl_proxy_marshal_flags`, which needs
+Wayland 1.22+'s constructor-style ABI (older machines skip the test rather than
+fail it), but not a single Wayland include. The core protocol's interfaces come
+from data symbols in the library; the xdg-shell ones are hand-declared structs.
+That bought two days of the loader's own class of lesson:
+
+- **Opcodes are file order, not sorted order.** `xdg_wm_base`'s second request
+  is `create_positioner` (opcode 1), and `get_xdg_surface` is opcode 2 — the
+  first build called opcode 1 with a `wl_surface` argument, and the compositor
+  replied with a protocol error about `xdg_positioner#6.set_size`, which reads
+  like a corrupt message until named for what it is: my `xdg_surface` object id
+  had been born an `xdg_positioner`.
+- **Every `new_id` argument consumes a vararg slot.** `wl_argument_from_va_list`
+  reads one pointer per signature argument and
+  `wl_proxy_marshal_array_flags` afterwards overwrites the `new_id` slot — so a
+  call must pass a placeholder (`NULL`, as the protocol codegen emits) per
+  `new_id`, or the real argument it shifts lands on the next slot and gets
+  dereferenced as a pointer in the send path. `wl_registry.bind` is the
+  historical `usun` quirk, so its placeholder goes *last*.
+- **Event lists must cover the negotiated version.** Binding a full
+  `xdg_wm_base` 7 and declaring only `configure` and `close` on
+  `xdg_toplevel` invites `configure_bounds` and `wm_capabilities` into a
+  dispatch table that cannot name them. All four are declared.
+
+The window is mapped through the real xdg handshake (commit, configure,
+`ack_configure`, commit) rather than committed bare, because a role-less
+surface's buffer-release flow is not something the test's compare step can
+lean on. Everything the X11 test checks (§3.13's battery, the triangle, the
+frame dump, scaling) is checked the same way under Wayland, plus a second
+swapchain whose resize path is exercised and a watchdog that turns any
+compositor-side stall into a failure instead of a hang.
+
+**Costs and deviations, recorded:** presenting on Wayland does not wait for the
+compositor the way X11's present does, because waiting is the compositor's job
+there and waiting harder would only add latency; the Wayland context exists on
+the application's connection, so its lifetime is the instance's, and a
+difference in `wl_display` identity is answered with the honest refusal above;
+`vkGetPhysicalDevice{Xcb,Xlib,Wayland}PresentationSupportKHR` answer X11 when
+the live context is on X11, Wayland when it is already on the asked connection
+or free to move there, and queue family 0 always presents; the passed visual id
+and screen are still not matched, because on Mesa's platforms they are the same
+config Kniz's context already uses.
+
+**Capability answers are read live, not remembered.** The instance snapshots
+the context's capabilities at creation, and M3c made that snapshot able to lie:
+after the context moved to the application's `wl_display`, it still described
+the X11 context that no longer exists — window capability included, since
+`finish_setup` used to count X11 alone. A migration test passed its support
+check on that stale coincidence, which is the worst kind of passing. The
+presentation-support entry points and the swapchain creation gate now read the
+live context: `GetPhysicalDeviceSurfaceSupportKHR` answers per platform — an
+X11 surface needs the context on X11, a Wayland surface needs it on that
+connection, which the loader's lazy create guarantees before the query runs,
+except for callers that bypass the loader, and the explicit check exists for
+them — and the three per-platform presentation queries phrase the Wayland one
+as the migration policy's own question. What still reads the snapshot is
+unchanged on purpose: `vkCreateDevice`'s feature gates and the adapter identity
+hash describe the GL feature set, which does not change when the window
+platform does, because both contexts come from the same Mesa driver and EGL
+library.
+
 ## 4. Milestones
 
 | | Goal | Proves | Gate |
@@ -710,7 +835,7 @@ semaphore is one of §7's non-goals.
 | **M2d** ✅ | Samplers and textures | GL's sampler state lives on the texture where Vulkan's lives on a sampler object | numeric test passes |
 | **M3a** ✅ | Swapchain and presentation on an X11 window | WSI: surfaces, images the driver owns, and the one legitimate flip | presented frame matches the image |
 | **M3b** ✅ | Depth testing, depth writes, binary semaphores; `vkcube` runs | The pipeline state `vkcube` needs before it will draw | The nine-phase depth chain, and `vkcube` on screen |
-| **M3c** | Wayland surfaces (`VK_KHR_wayland_surface`) | WSI on a Wayland-only desktop, which several distributions ship as default | `vkcube` under Wayland, swapchain on a `wl_display` |
+| **M3c** ✅ | Wayland surfaces (`VK_KHR_wayland_surface`) | WSI on a Wayland-only desktop, which several distributions ship as default | `vkcube` under Wayland, swapchain on a `wl_display` |
 | **M4** | Fences, events, timestamps, queries | Correctness and sync an indeterminate application assumes exists | sample suite runs |
 | **M5** | The smooth tier: per-draw state diffs, descriptor dirty-tracking, persistent buffers | Something close to 60 fps *for the supported subset* — see §6 | a real Vulkan 1.0-subset game at vsync on this machine |
 | **M6** | Windows: WGL context backend, ICD manifest placement, CI build | The same driver on the other half of desktop users | `vkcube` on Windows through WGL, or through ANGLE where WGL is not honest |
@@ -1124,6 +1249,21 @@ through them yet; and a `loadOp LOAD` pass on a framebuffer that has never been
 rendered into reads GL's undefined initial contents, which the test never
 exercises because a framebuffer that has not been rendered to has no honest
 contents to load.
+
+M3c is done: its test (`tests/wayland.cpp`) speaks Wayland through a dlopen with
+the xdg-shell interfaces hand-declared, maps a real window through the xdg
+handshake on this machine's compositor (Hyprland), and runs the same battery as
+the X11 test — the refusals, the triangle compared pixel for pixel, the connected
+present dump, acquisition round robin, a bogus-index refusal and a second
+swapchain whose smaller extents drive `wl_egl_window_resize` — while `vkcube
+--wsi wayland` presents its depth-tested lunar cube on the compositor two
+swapchains in. The three engineering stories §3.15 records (the loader defers an
+ICD's first sight of a surface until the first WSI query, so the migration gate
+is live window surfaces, not devices; every `new_id` argument consumes a vararg
+slot, and `wl_registry.bind` is the `usun` quirk; opcode order is file order) are
+the milestones the next Wayland task will reuse, and they were found the way
+everything else here is found: by the failures a compositor answers with, rather
+than by assuming.
 
 ## 5. Windows
 

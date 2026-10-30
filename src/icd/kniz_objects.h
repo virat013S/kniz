@@ -877,8 +877,25 @@ struct Surface {
 
   // An X11 XID, kept as an integer rather than as an xcb_window_t so that no
   // platform header has to be included here.  Both VK_KHR_xcb_surface and
-  // VK_KHR_xlib_surface hand us this same number.
+  // VK_KHR_xlib_surface hand us this same number.  Zero on a Wayland surface,
+  // which carries pointers instead.
   uint64_t native_window = 0;
+
+  // The Wayland variant.  Wayland objects are scoped to the connection that
+  // made them -- a wl_surface created on one wl_display is invisible to
+  // another -- so both pointers are kept, and both are what EGL is handed for
+  // the Wayland platform.  Finally `wayland` records which flavour this is, so
+  // the swapchain knows whether the drawable's source is a native window ID or
+  // a wl_surface.
+  bool wayland = false;
+  void* wl_display = nullptr;
+  void* wl_surface = nullptr;
+
+  // The extent the wl_egl_window currently has, set by the swapchain that
+  // created or last resized it.  A replacement swapchain with a different
+  // extent has to resize the window; one with the same extent must not, since
+  // a needless wl_egl_window_resize is a round of buffer churn on the compositor.
+  VkExtent2D wayland_extent = {};
 
   // The EGL drawable for that window, created the first time a swapchain needs
   // it and destroyed with the surface.

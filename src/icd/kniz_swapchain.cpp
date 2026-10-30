@@ -1,4 +1,5 @@
-// Presentation: VK_KHR_surface, VK_KHR_xcb_surface and VK_KHR_swapchain.
+// Presentation: VK_KHR_surface, VK_KHR_xcb_surface, VK_KHR_wayland_surface and
+// VK_KHR_swapchain.
 //
 // The shape of the translation is forced by one fact: GL cannot make a texture
 // *be* a window's front buffer.  So a swapchain image is an ordinary GL texture
@@ -375,6 +376,74 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateXcbSurfaceKHR(
   return VK_SUCCESS;
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL CreateWaylandSurfaceKHR(
+    VkInstance instanceHandle, const WaylandSurfaceCreateInfo* pCreateInfo,
+    const VkAllocationCallbacks* pAllocator, VkSurfaceKHR* pSurface) {
+  if (pSurface == nullptr)
+    return VK_ERROR_INITIALIZATION_FAILED;
+  *pSurface = VK_NULL_HANDLE;
+
+  Instance* instance = from_handle(instanceHandle);
+  if (instance == nullptr)
+    return VK_ERROR_INITIALIZATION_FAILED;
+  if (pCreateInfo == nullptr || pCreateInfo->display == nullptr ||
+      pCreateInfo->surface == nullptr) {
+    KNIZ_ERR("vkCreateWaylandSurfaceKHR needs both a wl_display and a wl_surface");
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+  if (pAllocator != nullptr)
+    KNIZ_WARN("host allocation callbacks are not supported and will be ignored");
+
+  // The context has to be on the application's wl_display before any drawing
+  // happens.  A GL context lives on exactly one EGL display (§3 of DESIGN.md),
+  // and on Wayland that display has to be built on the same connection that
+  // owns the wl_surface.  So:
+  //
+  //   * already on this wl_display -> nothing to do, a second surface on the
+  //     same connection shares the context as it shares everything else;
+  //
+  //   * stranding nothing -> the context is rebuilt on the application's
+  //     wl_display right here, whatever platform it came up on.  This is not
+  //     gated on device existence: the loader defers an ICD's first sight of a
+  //     surface until the application's first WSI query (wsi_unwrap_icd_surface
+  //     creates "ICD-specific surface objects" lazily), which typically runs
+  //     after vkCreateDevice, but GL objects are only born inside the entry
+  //     points that follow, swapchain creation among them.  Nothing survives a
+  //     context rebuild the first time this runs, whatever the call sequence.
+  //
+  //   * serving another window system -> a live X11 window surface, or a
+  //     surface on a different wl_display, would die with the context.  The
+  //     surface is refused with the reason rather than quietly breaking the
+  //     others.  One window system per context is the rule.
+  if (gl::wayland_context_matches(pCreateInfo->display)) {
+    KNIZ_DBG("surface joins the Wayland context already on this wl_display");
+  } else if (!gl::can_migrate_to_wayland(pCreateInfo->display)) {
+    KNIZ_ERR("vkCreateWaylandSurfaceKHR: the OpenGL context already serves "
+             "window surfaces on a different window system%s; a Wayland "
+             "surface needs the context rebuilt on the application's "
+             "wl_display, which would strand the surfaces that already exist",
+             gl::window_platform() == gl::WindowPlatform::X11 ? " (X11)" : "");
+    return VK_ERROR_INITIALIZATION_FAILED;
+  } else if (!gl::migrate_to_wayland(pCreateInfo->display)) {
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+
+  Surface* surface = nullptr;
+  try {
+    surface = new Surface();
+  } catch (const std::bad_alloc&) {
+    return VK_ERROR_OUT_OF_HOST_MEMORY;
+  }
+  surface->instance = instance;
+  surface->wayland = true;
+  surface->wl_display = pCreateInfo->display;
+  surface->wl_surface = pCreateInfo->surface;
+
+  *pSurface = to_handle(surface);
+  KNIZ_DBG("wayland surface created for wl_surface %p", pCreateInfo->surface);
+  return VK_SUCCESS;
+}
+
 VKAPI_ATTR void VKAPI_CALL DestroySurfaceKHR(VkInstance instanceHandle,
                                              VkSurfaceKHR surfaceHandle,
                                              const VkAllocationCallbacks*) {
@@ -386,6 +455,30 @@ VKAPI_ATTR void VKAPI_CALL DestroySurfaceKHR(VkInstance instanceHandle,
     gl::destroy_window_surface(surface->window);
   surface->magic = 0;
   delete surface;
+}
+
+// The presentation-support answers.  Two halves are involved: (a) the queue
+// family -- 0 is the only family and it is the one that presents -- and (b)
+// whether a window of the platform asked about can reach the screen.  (b) is
+// read from the live context rather than from the capability snapshot taken at
+// instance creation, because M3c moves the context between window systems
+// after that snapshot (§3.15), and the snapshot then describes a context that
+// no longer exists.  For a Wayland connection "can" is the migration policy's
+// own question: the context already runs on it, or no live window surface of
+// another kind would block the move there.
+bool queue_family_presentation_capable(VkPhysicalDevice physicalHandle,
+                                       uint32_t queueFamilyIndex) {
+  PhysicalDevice* physical = from_handle(physicalHandle);
+  if (physical == nullptr)
+    return VK_FALSE;
+  return queueFamilyIndex == 0;
+}
+
+// The X11 platform half.  An honest "no" here is the same refusal the
+// swapchain will give, said one round earlier.
+bool x11_presentation_capable() {
+  return gl::window_platform() == gl::WindowPlatform::X11 &&
+         gl::info().window_capable;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceSupportKHR(
@@ -403,11 +496,61 @@ VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceSupportKHR(
   if (queueFamilyIndex != 0)
     return VK_SUCCESS;
 
+  if (surface->wayland) {
+    // A Wayland surface reaches this driver only when the loader has already
+    // made contact with it: the loader creates the ICD half of the surface at
+    // the first WSI query, and that is exactly what moves the context onto
+    // the surface's connection (§3.15).  By the time this query runs, the
+    // context therefore already is on that connection -- or the surface
+    // creation refused, in which case this query is never called.  The
+    // explicit check keeps the answer honest for callers that bypass the
+    // loader and ask directly.
+    *pSupported = gl::wayland_context_matches(surface->wl_display) &&
+                          gl::info().window_capable
+                      ? VK_TRUE
+                      : VK_FALSE;
+    return VK_SUCCESS;
+  }
+
   // Reported honestly rather than optimistically: on a surfaceless context
   // there is no way to put a pixel on a screen, and an application that asks
   // deserves to be told before it builds a swapchain around the answer.
-  *pSupported = physical->instance->gl.window_capable ? VK_TRUE : VK_FALSE;
+  *pSupported = x11_presentation_capable() ? VK_TRUE : VK_FALSE;
   return VK_SUCCESS;
+}
+
+// The per-platform presentation support queries.  The native handles are not
+// fully interpreted: what the answer carries is (a) the queue family exists
+// and presents in the normal Vulkan way here -- queue family 0, the only
+// family -- and (b) the live context can present to that platform, or for
+// Wayland will be able to once the surface path moves it there.  An
+// application opening a different visual id or screen than the one the window
+// will draw through is outside this driver's reach anyway; on Mesa's
+// platforms these are the same answer.
+VKAPI_ATTR VkBool32 VKAPI_CALL GetPhysicalDeviceXcbPresentationSupportKHR(
+    VkPhysicalDevice physicalHandle, uint32_t queueFamilyIndex,
+    const void* connection, uint32_t visual) {
+  (void)connection;
+  (void)visual;
+  return queue_family_presentation_capable(physicalHandle, queueFamilyIndex) &&
+         x11_presentation_capable();
+}
+
+VKAPI_ATTR VkBool32 VKAPI_CALL GetPhysicalDeviceXlibPresentationSupportKHR(
+    VkPhysicalDevice physicalHandle, uint32_t queueFamilyIndex,
+    const void* display, uint32_t screen) {
+  (void)display;
+  (void)screen;
+  return queue_family_presentation_capable(physicalHandle, queueFamilyIndex) &&
+         x11_presentation_capable();
+}
+
+VKAPI_ATTR VkBool32 VKAPI_CALL GetPhysicalDeviceWaylandPresentationSupportKHR(
+    VkPhysicalDevice physicalHandle, uint32_t queueFamilyIndex,
+    const void* display) {
+  return queue_family_presentation_capable(physicalHandle, queueFamilyIndex) &&
+         (gl::wayland_context_matches(display) ||
+          gl::can_migrate_to_wayland(display));
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceCapabilitiesKHR(
@@ -580,7 +723,10 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(
              pCreateInfo->minImageCount);
     return VK_ERROR_INITIALIZATION_FAILED;
   }
-  if (!device->instance->gl.window_capable) {
+  // The live context, not the instance's snapshot: M3c moves the context
+  // between window systems after instance creation (§3.15), and the snapshot
+  // can describe a context that no longer exists.
+  if (!gl::info().window_capable) {
     KNIZ_ERR("cannot create a swapchain: this OpenGL context has no window "
              "system to present to (it is a headless context, which is the "
              "normal case in a container)");
@@ -606,11 +752,37 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateSwapchainKHR(
   swapchain->present_mode = pCreateInfo->presentMode;
 
   if (surface->window == nullptr) {
-    surface->window = gl::create_window_surface(surface->native_window);
+    // The drawable is created here rather than at surface creation because a
+    // wl_egl_window is born with a size, and the size a swapchain will use is
+    // not known before the swapchain exists.  On X11 the size question does not
+    // arise (the window's own size is the drawable's), which is why the X11
+    // path has no counterpart to this call's arguments.
+    if (surface->wayland) {
+      surface->window = gl::create_window_surface_wayland(
+          surface->wl_surface,
+          static_cast<int>(pCreateInfo->imageExtent.width),
+          static_cast<int>(pCreateInfo->imageExtent.height));
+    } else {
+      surface->window = gl::create_window_surface(surface->native_window);
+    }
     if (surface->window == nullptr) {
       delete swapchain;
       return VK_ERROR_SURFACE_LOST_KHR;
     }
+    surface->wayland_extent = pCreateInfo->imageExtent;
+  } else if (surface->wayland &&
+             (surface->wayland_extent.width != pCreateInfo->imageExtent.width ||
+              surface->wayland_extent.height !=
+                  pCreateInfo->imageExtent.height)) {
+    // A swapchain replaced an older one and the extent moved: the wl_egl_window
+    // is resized in place, exactly what a Wayland application does for its own
+    // window (the EGL surface itself can stay attached to it).
+    gl::window_surface_resize_wayland(
+        surface->window, static_cast<int>(pCreateInfo->imageExtent.width),
+        static_cast<int>(pCreateInfo->imageExtent.height));
+    KNIZ_DBG("wl_egl_window resized to %ux%u for the new swapchain",
+             pCreateInfo->imageExtent.width, pCreateInfo->imageExtent.height);
+    surface->wayland_extent = pCreateInfo->imageExtent;
   }
 
   if (!create_present_state(swapchain)) {

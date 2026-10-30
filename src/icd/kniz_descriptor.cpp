@@ -845,8 +845,20 @@ void destroy_push_constant_buffer(Device* device) {
 }
 
 bool reset_push_constants(Device* device) {
-  if (device == nullptr || device->push_constant_buffer == 0)
+  if (device == nullptr)
     return true;
+  if (device->push_constant_buffer == 0) {
+    // The first submission makes the home.  vkCreateDevice deliberately
+    // creates nothing here: the GL context can be rebuilt after the device
+    // exists (migrate_to_wayland), and device-level GL state must therefore be
+    // born on the context the application ends up presenting through.
+    if (!device->instance->gl_ready || !device->instance->gl.uniform_capable)
+      return true;
+    if (!create_push_constant_buffer(device)) {
+      KNIZ_ERR("could not create the push constant buffer");
+      return false;
+    }
+  }
 
   // kMaxPushConstantsSize zeroes is a small enough upload that doing it per
   // submission is cheaper than tracking whether the contents are known -- and

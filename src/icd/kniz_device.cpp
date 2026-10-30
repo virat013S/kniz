@@ -230,19 +230,11 @@ VKAPI_ATTR VkResult VKAPI_CALL CreateDevice(
   device->queue.queue_index = 0;
 
   // Push constants have no GL equivalent, so they are lowered onto a uniform
-  // buffer that the device owns and the replay uploads to.  Created here rather
-  // than lazily so that its absence is a device creation failure rather than a
-  // failure halfway through a submission, and so that a command buffer that
-  // writes push constants before any pipeline layout declares ranges still has
-  // somewhere to put them.
-  if (device->instance->gl_ready && device->instance->gl.uniform_capable) {
-    if (!create_push_constant_buffer(device)) {
-      KNIZ_ERR("could not create the push constant buffer");
-      delete device;
-      *pDevice = VK_NULL_HANDLE;
-      return VK_ERROR_INITIALIZATION_FAILED;
-    }
-  }
+  // buffer that the device owns and the replay uploads to.  Created at the
+  // first submission rather than here: the GL context can be rebuilt after a
+  // device exists (migrate_to_wayland), and a buffer made on the context it
+  // replaces would be a name without an object on the new one.  vkCreateDevice
+  // taking no GL state at all is what keeps that possible.
 
   *pDevice = to_handle(device);
   KNIZ_INFO("device created (queue family 0)");

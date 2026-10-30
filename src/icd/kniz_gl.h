@@ -143,10 +143,61 @@ enum class WindowPlatform {
 // Which platform the current context belongs to.  None before create_headless.
 WindowPlatform window_platform();
 
+// True when the context is up on the Wayland platform and was built on exactly
+// the wl_display given.  This is the question vkCreateWaylandSurfaceKHR asks,
+// because the answer decides whether a context can be built or must be refused.
+bool wayland_context_matches(const void* wl_display);
+
+// True when a Wayland surface for this wl_display can bring the context over:
+// no live window surface on any other window system, since an X11 window
+// drawable or a Wayland surface of another wl_display would die with the move.
+// The loader delivers surfaces at its first WSI query rather than at the app's
+// vkCreateWaylandSurfaceKHR call, so this question can be asked long after
+// vkCreateDevice; device existence changes nothing here.
+bool can_migrate_to_wayland(const void* wl_display);
+
+// Bring the context up on the Wayland platform, on the application's own
+// wl_display.
+//
+// Why the application's display and not a connection of our own: Wayland
+// objects are scoped to the connection that created them, so a wl_surface made
+// on the application's connection is invisible to any other connection, and
+// EGL's Wayland platform draws to a window only through the same connection
+// that owns it.  X11 is the other way round -- XIDs are server-wide, which is
+// why create_window_surface can work on a display EGL opened itself.
+//
+// Refuses when a context already exists, on any platform: even after migration
+// (migrate_to_wayland) this entry point expects none.  A second surface created
+// by the same application passes through wayland_context_matches instead.
+bool create_on_wayland(const void* wl_display);
+
+// Tear the existing context down and build a new one on the application's
+// wl_display.  Only safe while nothing has been drawn to a window: any GL
+// object can be rebuilt, but the EGLSurfaces a swapchain presents through
+// cannot cross the rebuild.  CreateWaylandSurfaceKHR guards the call with
+// can_migrate_to_wayland, which is false once a window surface exists on
+// another platform (see DESIGN.md §3.15).
+bool migrate_to_wayland(const void* wl_display);
+
 // Create a window surface for a native window handle, which is an X11 XID on
 // every platform Kniz supports so far.  Returns nullptr on failure, having
 // logged why.
 WindowSurface create_window_surface(uint64_t native_window);
+
+// The Wayland window surface: the native handle is the application's
+// wl_surface, wrapped in a wl_egl_window of the given size before EGL sees it
+// -- EGL's Wayland platform draws to a wl_egl_window, never to the wl_surface
+// itself.  libwayland-egl is opened with dlopen for exactly those three
+// functions (create, resize, destroy); a machine without it refuses here with
+// the reason rather than at build time.  Returns nullptr on failure, having
+// logged why.
+WindowSurface create_window_surface_wayland(const void* wl_surface, int width,
+                                            int height);
+
+// Resize the wl_egl_window behind a Wayland window surface.  A swapchain that
+// replaced an older one cannot always keep the former extent, and GL window
+// resizing on Wayland goes through this call rather than through EGL.
+void window_surface_resize_wayland(WindowSurface surface, int width, int height);
 
 void destroy_window_surface(WindowSurface surface);
 
